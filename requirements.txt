@@ -1,0 +1,7 @@
+torch>=2.0.0 #
+numpy>=1.22,<2.0
+tqdm>=4.66
+matplotlib>=3.7
+visdom>=0.2.4
+gymnasium>=0.29; platform_system != "Windows"
+gym>=0.26; platform_system == "Windows"

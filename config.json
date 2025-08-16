@@ -1,0 +1,54 @@
+{
+  "env_paras": {
+    "num_usvs": 5,
+    "num_tasks": 24,
+    "map_size": [
+      120,
+      120
+    ],
+    "battery_capacity": 220.0,
+    "usv_speed": 5.0,
+    "charge_time": 30.0,
+    "device": "cuda:0"
+  },
+  "model_paras": {
+    "embedding_dim": 64,
+    "num_heads": 1,
+    "num_hgnn_layers": 2,
+    "eta_neighbors": 3,
+    "mlp_hidden_dim": 128,
+    "n_hidden_actor": 2,
+    "n_hidden_critic": 2,
+    "n_latent_actor": 96,
+    "n_latent_critic": 96,
+    "dropout": 0.0,
+    "device": "cuda:0"
+  },
+  "train_paras": {
+    "lr": 0.0003,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "gamma": 0.99,
+    "K_epochs": 4,
+    "eps_clip": 0.2,
+    "A_coeff": 1.0,
+    "vf_coeff": 0.5,
+    "entropy_coeff": 0.01,
+    "max_episodes": 800,
+    "save_frequency": 40,
+    "eval_frequency": 20,
+    "minibatch_size": 256,
+    "viz": true,
+    "viz_name": "USV_HGNN_PPO_RTX2060_5x24"
+  },
+  "test_paras": {
+    "num_test_instances": 10,
+    "sample": false,
+    "num_sample": 10,
+    "num_average": 3,
+    "data_path": "data/instances"
+  },
+  "_comment": "切换到 3×30：请使用 config/rtx2060_3x30_visdom.json"
+}
