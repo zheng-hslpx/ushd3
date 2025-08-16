@@ -1,0 +1,58 @@
+{
+  "env_paras": {
+    "num_usvs": 5,
+    "num_tasks": 24,
+    "map_size": [120, 120],
+    "battery_capacity": 220.0,
+    "usv_speed": 5.0,
+    "charge_time": 30.0,
+    "device": "cuda:0",
+    "min_task_time_visual": 5.0,
+    "reward_config": {
+      "use_potential_based_reward": true,
+      "makespan_normalization": 1200.0,
+      "w_makespan": 1.0,
+      "w_fairness": 0.3,
+      "w_variance": 0.1,
+      "w_travel_time_penalty": 0.5
+    },
+    "dynamic_masking_config": {
+      "enabled": true,
+      "max_load_ratio": 1.8
+    }
+  },
+  "model_paras": {
+    "embedding_dim": 64,
+    "num_heads": 1,
+    "num_hgnn_layers": 2,
+    "eta_neighbors": 3,
+    "mlp_hidden_dim": 128,
+    "n_hidden_actor": 2,
+    "n_hidden_critic": 2,
+    "n_latent_actor": 96,
+    "n_latent_critic": 96,
+    "dropout": 0.0,
+    "device": "cuda:0"
+  },
+  "train_paras": {
+    "lr": 5e-5,
+    "betas": [0.9, 0.999],
+    "gamma": 0.99,
+    "K_epochs": 4,
+    "eps_clip": 0.2,
+    "A_coeff": 1.0,
+    "vf_coeff": 0.5,
+    "entropy_coeff": 0.01,
+    "max_episodes": 1500,
+    "minibatch_size": 256,
+    "save_frequency": 100,
+    "eval_frequency": 50,
+    "report_root": "results/reports",
+    "report_episodes": 50,
+    "viz": true,
+    "viz_name": "USV_HGNN_PPO_FinalTune",
+    "save_root": "results/saved_models",
+    "save_only_last": false,
+    "run_name": "FinalTune_RTX2060_5x24"
+  }
+}
