@@ -14,7 +14,7 @@ usv-hgnn-ppo/
 ├── config.json
 ├── config
 │   ├── default.json
-│   ├── improved_config.py
+│   ├── improved_config.json
 ├── requirements.txt
 ├── train.py
 ├── evaluate.py
