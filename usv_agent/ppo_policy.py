@@ -442,8 +442,13 @@ class EnhancedPPO:
         self.eps_clip = float(config.get('eps_clip', 0.15))  # 略微增加
         self.K_epochs = int(config.get('K_epochs', 4))  # 减少epoch数
         self.vf_coeff = float(config.get('vf_coeff', 0.3))  # 降低value loss权重
-        self.entropy_coeff = float(config.get('entropy_coeff', 0.02))  # 增加探索
-        self.minibatch_size = int(config.get('minibatch_size', 64))  # 减小batch size
+        
+        # 新的一周修改+序号3：关闭最大熵损失
+        # 说明：将熵损失系数设置为0，完全关闭探索奖励，专注于exploitation
+        self.entropy_coeff = 0.0  # 原本为 float(config.get('entropy_coeff', 0.02))
+        print(f"[INFO] Entropy coefficient set to 0.0 - Exploration disabled")
+        
+        self.minibatch_size = int(config.get('minibatch_size', 64))  # 减少batch size
         self.gae_lambda = float(config.get('gae_lambda', 0.95))
         self.max_grad_norm = float(config.get('max_grad_norm', 0.5))
         
@@ -470,9 +475,73 @@ class EnhancedPPO:
             'gradient_norms': {'actor': [], 'critic': []}
         }
 
+        # 8.23修改_序号1：尾段线性退火—参数读取与初始化
+        # 说明：从config读取max_episodes与退火目标；默认在最后25%训练内线性插值到目标值。
+        self.total_episodes = int(config.get('max_episodes', 1000))
+        self.tail_start_frac = float(config.get('tail_start_frac', 0.75))
+        self.tail_start_episode = int(config.get('tail_start_episode', round(self.total_episodes * self.tail_start_frac)))
+        self._episode_counter = 0  # 以update调用次数为"episode"计数
+
+        # 记录基线超参
+        self.base_lr = initial_lr
+        self.base_clip = self.eps_clip
+        self.base_entropy = self.entropy_coeff  # 现在是0.0
+        self.base_K = self.K_epochs
+        self.base_vf = self.vf_coeff
+
+        # 退火目标（来自你的要求）
+        self.tail_lr_target = float(config.get('tail_lr_target', 8e-5))   # 2e-4 -> 8e-5（若你的初始lr=2e-4则会下降）
+        self.tail_clip_target = float(config.get('tail_clip_target', 0.06))
+        self.tail_entropy_target = float(config.get('tail_entropy_target', 0.0))  # 保持为0
+        self.tail_K_target = int(config.get('tail_K_epochs_target', 6))
+        self.tail_vf_target = float(config.get('tail_vf_coeff_target', 0.5))
+
+        # 退火阶段是否禁用自适应调度（避免二者"打架"，在尾段以退火为准）
+        self.disable_scheduler_in_tail = bool(config.get('disable_scheduler_in_tail', True))
+
+    # 8.23修改_序号2：尾段线性退火内核
+    # 说明：当 episode >= tail_start_episode 时，按线性插值更新 lr/clip/entropy/K_epochs/vf_coeff。
+    def _apply_tail_anneal(self):
+        self._episode_counter += 1
+        if self._episode_counter < self.tail_start_episode:
+            return False  # 还未进入尾段
+
+        # 进度（0~1）
+        denom = max(1, self.total_episodes - self.tail_start_episode)
+        p = min(1.0, (self._episode_counter - self.tail_start_episode) / denom)
+
+        # 线性插值函数
+        def lerp(a, b, t): return a + (b - a) * t
+
+        # 计算当下目标
+        lr_target = lerp(self.base_lr, self.tail_lr_target, p)
+        clip_target = lerp(self.base_clip, self.tail_clip_target, p)
+        entropy_target = lerp(self.base_entropy, self.tail_entropy_target, p)  # 0.0 -> 0.0
+        K_target = int(round(lerp(self.base_K, self.tail_K_target, p)))
+        vf_target = lerp(self.base_vf, self.tail_vf_target, p)
+
+        # 设置优化器学习率（尾段直接以退火值为准）
+        for g in self.optimizer.param_groups:
+            g['lr'] = lr_target
+
+        # 覆盖本轮训练所用的关键超参
+        self.eps_clip = float(clip_target)
+        self.entropy_coeff = float(entropy_target)  # 保持为0
+        self.K_epochs = int(max(1, K_target))
+        self.vf_coeff = float(vf_target)
+
+        print(f"[TailAnneal] ep={self._episode_counter} p={p:.2f} | "
+              f"lr={lr_target:.2e} clip={self.eps_clip:.3f} "
+              f"entropy={self.entropy_coeff:.4f} K={self.K_epochs} vf={self.vf_coeff:.2f}")
+        return True
+
     def update(self, memory: Memory):
         dev = self.agent.device
         
+        # 8.23修改_序号3：在每次update开始时尝试应用"尾段线性退火"
+        # 说明：进入尾段后，学习率直接以退火值为准；并可选择禁用自适应调度器。
+        in_tail = self._apply_tail_anneal()
+
         # 学习率监控
         current_lr = self.optimizer.param_groups[0]['lr']
         print(f"\nCurrent Learning Rate: {current_lr:.2e}")
@@ -549,10 +618,10 @@ class EnhancedPPO:
                 
                 entropy_loss = entropy.mean()
                 
-                # *** 改进：动态损失权重 ***
+                # *** 注意：entropy_coeff现在为0，所以熵损失不会影响训练 ***
                 total_loss = (actor_loss + 
                              self.vf_coeff * critic_loss - 
-                             self.entropy_coeff * entropy_loss)
+                             self.entropy_coeff * entropy_loss)  # entropy_coeff = 0
                 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -579,10 +648,13 @@ class EnhancedPPO:
         
         self.agent.update_old_policy()
         
-        # *** 核心改进：自适应学习率调度 ***
+        # 8.23修改_序号4：与自适应调度器的配合策略
+        # 说明：若进入尾段并启用"禁止调度器"，则不再调用scheduler.step，完全以退火值为准。
+        #       尾段前维持你原有自适应调度逻辑。
         avg_critic_loss = total_critic_loss / num_updates
         avg_reward = rewards.mean().item()
-        self.scheduler.step(avg_critic_loss, avg_reward)
+        if not (in_tail and self.disable_scheduler_in_tail):
+            self.scheduler.step(avg_critic_loss, avg_reward)
         
         # 更新训练统计
         self.training_stats['critic_losses'].append(avg_critic_loss)
@@ -593,6 +665,11 @@ class EnhancedPPO:
             'critic_loss': avg_critic_loss,
             'entropy_loss': total_entropy_loss / num_updates,
             'current_lr': self.optimizer.param_groups[0]['lr'],
+            # 8.23修改_序号5：把当前关键超参也回传（logger若未收集会自动忽略）
+            'current_eps_clip': self.eps_clip,
+            'current_entropy_coeff': self.entropy_coeff,
+            'current_vf_coeff': self.vf_coeff,
+            'current_K_epochs': self.K_epochs,
             'grad_norm_actor': np.mean(self.agent.grad_stats['actor'][-10:]) if self.agent.grad_stats['actor'] else 0,
             'grad_norm_critic': np.mean(self.agent.grad_stats['critic'][-10:]) if self.agent.grad_stats['critic'] else 0
         }
