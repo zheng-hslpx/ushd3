@@ -51,7 +51,14 @@
     "device": "cuda:0",
     "use_batch_norm": true,
     "graph_pool": "mean",
-    "residual_blocks": 2
+    "residual_blocks": 2,
+    
+    "_exploration_comment": "=== 探索机制核心参数 ===",
+    "initial_epsilon": 0.3,
+    "min_epsilon": 0.05,
+    "epsilon_decay": 0.995,
+    "exploration_steps": 1000,
+    "adaptive_epsilon": true
   },
   
   "train_paras": {
@@ -76,18 +83,15 @@
     "save_frequency": 80,
     "eval_frequency": 25,
     
-    "_exploration_comment": "=== 探索机制核心参数配置 ===",
-    "initial_epsilon": 0.3,
-    "min_epsilon": 0.05,
-    "epsilon_decay": 0.995,
-    "exploration_steps": 1000,
-    "adaptive_epsilon": true,
-    
     "_exploration_schedule_comment": "=== 探索机制训练调度参数 ===",
     "epsilon_update_frequency": 10,
     "exploration_performance_threshold": -50,
     "adaptive_exploration": true,
     "exploration_boost_episodes": 100,
+    
+    "_debug_comment": "=== 调试和可视化参数 ===",
+    "debug_mode": false,
+    "plot_metrics_every": 50,
     
     "report_root": "results/reports",
     "report_episodes": 50,
