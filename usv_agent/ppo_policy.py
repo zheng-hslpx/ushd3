@@ -294,8 +294,12 @@ class AdaptiveLearningRateScheduler:
                 self.wait = 0
                 print(f"[INFO] Learning rate reduced to {self.optimizer.param_groups[0]['lr']:.2e}")
 
+# =============================================================================
+# *** 探索机制核心实现开始 - EXPLORATION MECHANISM CORE IMPLEMENTATION ***
+# =============================================================================
+
 class EnhancedPPOAgent(nn.Module):
-    """*** 增强版PPO智能体 ***"""
+    """*** 增强版PPO智能体 - 集成epsilon-greedy随机探索机制 ***"""
     def __init__(self, hgnn_model: nn.Module, config: dict):
         super().__init__()
         E = int(config['embedding_dim'])
@@ -318,6 +322,27 @@ class EnhancedPPOAgent(nn.Module):
             dropout
         )
 
+        # =======================================================================
+        # *** 探索机制参数配置 - EXPLORATION MECHANISM CONFIGURATION ***
+        # =======================================================================
+        self.exploration_config = {
+            'initial_epsilon': config.get('initial_epsilon', 0.3),    # 初始探索率30%
+            'min_epsilon': config.get('min_epsilon', 0.05),          # 最小探索率5%
+            'epsilon_decay': config.get('epsilon_decay', 0.995),     # 探索率衰减系数
+            'exploration_steps': config.get('exploration_steps', 1000),  # 探索阶段步数阈值
+            'adaptive_epsilon': config.get('adaptive_epsilon', True), # 启用自适应探索率调整
+        }
+        
+        # 探索机制运行时状态
+        self.current_epsilon = self.exploration_config['initial_epsilon']
+        self.training_step = 0
+        self.train_flag = True  # 训练模式标志：True=训练模式(启用探索), False=评估模式(禁用探索)
+        self.exploration_stats = {
+            'total_random_actions': 0,      # 总随机动作数
+            'recent_random_actions': 0,     # 最近的随机动作数
+            'exploration_episodes': 0,      # 探索的回合数
+        }
+
         # 网络初始化检查
         print("\n=== Enhanced Network Initialization Check ===")
         actor_params = sum(p.numel() for p in self.actor.parameters())
@@ -325,6 +350,13 @@ class EnhancedPPOAgent(nn.Module):
         print(f"Actor parameters: {actor_params:,}")
         print(f"Critic parameters: {critic_params:,}")
         print(f"Total parameters: {(actor_params + critic_params):,}")
+        print("=" * 50)
+        print(f"🎯 EXPLORATION MECHANISM INITIALIZED")
+        print(f"   Initial Epsilon: {self.current_epsilon:.3f}")
+        print(f"   Min Epsilon: {self.exploration_config['min_epsilon']:.3f}")
+        print(f"   Decay Rate: {self.exploration_config['epsilon_decay']:.4f}")
+        print(f"   Exploration Steps Threshold: {self.exploration_config['exploration_steps']}")
+        print("=" * 50)
         
         # *** 新增：梯度监控 ***
         self.grad_stats = {'actor': [], 'critic': []}
@@ -344,26 +376,149 @@ class EnhancedPPOAgent(nn.Module):
             x = torch.from_numpy(np.array(x))
         return x.to(self.device, dtype=dtype)
 
+    # ==========================================================================
+    # *** 探索机制核心方法 - EXPLORATION MECHANISM CORE METHODS ***
+    # ==========================================================================
+    
+    def update_epsilon(self):
+        """*** 探索率动态更新机制 - Dynamic Epsilon Update Mechanism ***"""
+        self.training_step += 1
+        old_epsilon = self.current_epsilon
+        
+        # 分阶段衰减策略：前期快速衰减，后期缓慢衰减
+        if self.training_step < self.exploration_config['exploration_steps']:
+            # 前期：指数衰减探索率
+            self.current_epsilon = max(
+                self.exploration_config['min_epsilon'],
+                self.current_epsilon * self.exploration_config['epsilon_decay']
+            )
+        else:
+            # 后期：线性衰减到最小值，保持少量探索
+            decay_ratio = min(1.0, (self.training_step - self.exploration_config['exploration_steps']) / 2000)
+            self.current_epsilon = max(
+                self.exploration_config['min_epsilon'],
+                self.exploration_config['min_epsilon'] * 2 * (1 - decay_ratio)
+            )
+        
+        # 输出探索率变化日志
+        if abs(old_epsilon - self.current_epsilon) > 0.001:
+            print(f"🔄 [EXPLORATION UPDATE] Step {self.training_step}: ε {old_epsilon:.4f} → {self.current_epsilon:.4f}")
+    
+    def set_train_mode(self, train_flag: bool):
+        """*** 训练/评估模式切换 - Training/Evaluation Mode Switch ***"""
+        self.train_flag = train_flag
+        if not train_flag:
+            print(f"📊 [MODE SWITCH] → EVALUATION Mode (epsilon = 0, deterministic actions)")
+        else:
+            print(f"🎯 [MODE SWITCH] → TRAINING Mode (epsilon = {self.current_epsilon:.3f}, exploration enabled)")
+
+    def get_exploration_stats(self):
+        """*** 获取探索统计信息 - Get Exploration Statistics ***"""
+        return {
+            'current_epsilon': self.current_epsilon,
+            'training_step': self.training_step,
+            'train_mode': self.train_flag,
+            'exploration_phase': 'early' if self.training_step < self.exploration_config['exploration_steps'] else 'late',
+            'total_random_actions': self.exploration_stats['total_random_actions'],
+            'recent_random_actions': self.exploration_stats['recent_random_actions'],
+        }
+
+    # ==========================================================================
+    # *** 动作选择核心方法（含探索机制） - Action Selection with Exploration ***
+    # ==========================================================================
+    
     @torch.no_grad()
     def get_action(self, state: Dict, usv_task_edges: torch.Tensor, deterministic: bool=False) -> Tuple[int, float, float]:
+        """*** 集成探索机制的动作选择方法 - Action Selection with Exploration Mechanism ***"""
         uf = self._to_dev(state['usv_features']).unsqueeze(0)
         tf = self._to_dev(state['task_features']).unsqueeze(0)
         am = self._to_dev(state['action_mask'], dtype=torch.bool).unsqueeze(0)
         ute = usv_task_edges.unsqueeze(0)
 
+        # 通过HGNN获取节点嵌入和图嵌入
         ue, te, ge = self.old_hgnn(uf, tf, ute)
         scores = self.old_actor(ue, te, ge)
         
-        # *** 改进：更鲁棒的动作选择 ***
+        # *** 动作掩码应用 - Apply Action Mask ***
         masked_scores = scores.masked_fill(~am, -1e8)
         
-        # 温度调节的softmax
-        temperature = 0.1 if deterministic else 1.0
-        probs = F.softmax(masked_scores / temperature, dim=-1)
-        
-        if torch.all(~am):
+        # 检查是否有有效动作
+        valid_actions = am.squeeze(0)
+        if torch.all(~valid_actions):
+            # 无有效动作时返回默认动作
             action, logp = torch.tensor(0, device=self.device), torch.tensor(0.0, device=self.device)
+            value = self.old_critic(ge).squeeze(-1)
+            return int(action.item()), float(logp.item()), float(value.item())
+        
+        # =======================================================================
+        # *** 探索机制决策核心逻辑 - EXPLORATION MECHANISM DECISION LOGIC ***
+        # =======================================================================
+        
+        # 只在训练模式且非确定性选择时启用探索
+        use_exploration = self.train_flag and not deterministic
+        
+        if use_exploration:
+            epsilon = self.current_epsilon
+            
+            # 🎲 epsilon-greedy探索策略决策点
+            if torch.rand(1).item() < epsilon:
+                # *** 执行随机探索动作 - EXECUTE RANDOM EXPLORATION ACTION ***
+                valid_indices = torch.where(valid_actions)[0]
+                if len(valid_indices) > 0:
+                    # 从有效动作中随机选择
+                    random_idx = torch.randint(0, len(valid_indices), (1,), device=self.device)
+                    action = valid_indices[random_idx]
+                    
+                    # 计算随机动作的log概率（用于策略梯度训练）
+                    temperature = 1.0
+                    probs = F.softmax(masked_scores / temperature, dim=-1)
+                    dist = torch.distributions.Categorical(probs=probs)
+                    logp = dist.log_prob(action)
+                    
+                    # 统计随机动作信息
+                    usv_idx = action.item() // tf.shape[1]
+                    task_idx = action.item() % tf.shape[1]
+                    self.exploration_stats['total_random_actions'] += 1
+                    self.exploration_stats['recent_random_actions'] += 1
+                    
+                    # 🎯 探索动作日志输出
+                    print(f"🎲 [RANDOM EXPLORATION] USV-{usv_idx} → Task-{task_idx} "
+                          f"(ε={epsilon:.3f}, total_random={self.exploration_stats['total_random_actions']})")
+                    
+                    # *** 无人船任务规划特定的探索合理性检查 ***
+                    # 检查当前USV的负载情况
+                    current_usv_assignments = state.get('usv_assignments', {}).get(str(usv_idx), [])
+                    if len(current_usv_assignments) > 3:  # 如果USV已有较多任务
+                        print(f"⚠️  [EXPLORATION WARNING] USV-{usv_idx} has high load: {len(current_usv_assignments)} tasks")
+                    
+                else:
+                    # 无有效动作时的回退处理
+                    action = torch.tensor(0, device=self.device)
+                    logp = torch.tensor(0.0, device=self.device)
+            else:
+                # *** 执行策略网络动作 - EXECUTE POLICY NETWORK ACTION ***
+                # 使用策略网络进行动作选择（贪心或采样）
+                temperature = 0.1 if deterministic else 1.0
+                probs = F.softmax(masked_scores / temperature, dim=-1)
+                dist = torch.distributions.Categorical(probs=probs)
+                
+                if deterministic:
+                    action = torch.argmax(probs, dim=-1)
+                else:
+                    action = dist.sample()
+                
+                logp = dist.log_prob(action)
+                
+                # 策略动作日志（较少输出）
+                if torch.rand(1).item() < 0.1:  # 10%概率输出策略动作日志
+                    usv_idx = action.item() // tf.shape[1]
+                    task_idx = action.item() % tf.shape[1]
+                    print(f"🧠 [POLICY ACTION] USV-{usv_idx} → Task-{task_idx} (policy-guided)")
         else:
+            # *** 评估模式或确定性模式：纯策略选择 ***
+            temperature = 0.1 if deterministic else 1.0
+            probs = F.softmax(masked_scores / temperature, dim=-1)
+            
             dist = torch.distributions.Categorical(probs=probs)
             if deterministic:
                 action = torch.argmax(probs, dim=-1)
@@ -372,8 +527,51 @@ class EnhancedPPOAgent(nn.Module):
                 action = dist.sample()
                 logp = dist.log_prob(action)
         
+        # 价值函数评估
         value = self.old_critic(ge).squeeze(-1)
+        
+        # *** 最终动作验证 - Final Action Validation ***
+        final_usv_idx = action.item() // tf.shape[1]
+        final_task_idx = action.item() % tf.shape[1]
+        
+        # 确保动作在有效范围内
+        if not valid_actions[action.item()]:
+            print(f"❌ [ERROR] Selected invalid action: USV-{final_usv_idx} → Task-{final_task_idx}")
+            # 回退到第一个有效动作
+            valid_indices = torch.where(valid_actions)[0]
+            if len(valid_indices) > 0:
+                action = valid_indices[0]
+                logp = dist.log_prob(action)
+        
         return int(action.item()), float(logp.item()), float(value.item())
+    
+    # =======================================================================
+    # *** 探索机制辅助方法 - EXPLORATION MECHANISM AUXILIARY METHODS ***
+    # =======================================================================
+    
+    def reset_exploration_episode_stats(self):
+        """*** 重置回合探索统计 - Reset Episode Exploration Statistics ***"""
+        self.exploration_stats['recent_random_actions'] = 0
+        self.exploration_stats['exploration_episodes'] += 1
+    
+    def log_exploration_summary(self):
+        """*** 输出探索机制总结信息 - Log Exploration Summary ***"""
+        stats = self.get_exploration_stats()
+        print("\n" + "="*60)
+        print("🎯 EXPLORATION MECHANISM SUMMARY")
+        print("="*60)
+        print(f"Current Epsilon: {stats['current_epsilon']:.4f}")
+        print(f"Training Step: {stats['training_step']}")
+        print(f"Mode: {'TRAINING' if stats['train_mode'] else 'EVALUATION'}")
+        print(f"Phase: {stats['exploration_phase'].upper()}")
+        print(f"Total Random Actions: {stats['total_random_actions']}")
+        print(f"Recent Random Actions: {stats['recent_random_actions']}")
+        print(f"Exploration Episodes: {self.exploration_stats['exploration_episodes']}")
+        print("="*60 + "\n")
+
+# =============================================================================
+# *** 探索机制核心实现结束 - EXPLORATION MECHANISM CORE IMPLEMENTATION END ***
+# =============================================================================
 
     def evaluate_actions(self, uf_b, tf_b, am_b, ute_b, actions_b):
         ue, te, ge = self.hgnn(uf_b, tf_b, ute_b)
@@ -433,7 +631,7 @@ class EnhancedPPOAgent(nn.Module):
         return actor_grad_norm, critic_grad_norm
 
 class EnhancedPPO:
-    """*** 增强版PPO训练器 ***"""
+    """*** 增强版PPO训练器 - 支持探索机制 ***"""
     def __init__(self, agent: EnhancedPPOAgent, config: dict):
         self.agent = agent
         
@@ -442,13 +640,8 @@ class EnhancedPPO:
         self.eps_clip = float(config.get('eps_clip', 0.15))  # 略微增加
         self.K_epochs = int(config.get('K_epochs', 4))  # 减少epoch数
         self.vf_coeff = float(config.get('vf_coeff', 0.3))  # 降低value loss权重
-        
-        # 新的一周修改+序号3：关闭最大熵损失
-        # 说明：将熵损失系数设置为0，完全关闭探索奖励，专注于exploitation
-        self.entropy_coeff = 0.0  # 原本为 float(config.get('entropy_coeff', 0.02))
-        print(f"[INFO] Entropy coefficient set to 0.0 - Exploration disabled")
-        
-        self.minibatch_size = int(config.get('minibatch_size', 64))  # 减少batch size
+        self.entropy_coeff = float(config.get('entropy_coeff', 0.02))  # 增加探索
+        self.minibatch_size = int(config.get('minibatch_size', 64))  # 减小batch size
         self.gae_lambda = float(config.get('gae_lambda', 0.95))
         self.max_grad_norm = float(config.get('max_grad_norm', 0.5))
         
@@ -468,83 +661,65 @@ class EnhancedPPO:
         self.best_eval_reward = float('-inf')
         self.patience_counter = 0
         
-        # *** 新增：训练统计 ***
+        # *** 新增：训练统计和探索管理 ***
         self.training_stats = {
             'critic_losses': [],
             'actor_losses': [],
-            'gradient_norms': {'actor': [], 'critic': []}
+            'gradient_norms': {'actor': [], 'critic': []},
+            'exploration_stats': []  # 新增探索统计
         }
-
-        # 8.23修改_序号1：尾段线性退火—参数读取与初始化
-        # 说明：从config读取max_episodes与退火目标；默认在最后25%训练内线性插值到目标值。
-        self.total_episodes = int(config.get('max_episodes', 1000))
-        self.tail_start_frac = float(config.get('tail_start_frac', 0.75))
-        self.tail_start_episode = int(config.get('tail_start_episode', round(self.total_episodes * self.tail_start_frac)))
-        self._episode_counter = 0  # 以update调用次数为"episode"计数
-
-        # 记录基线超参
-        self.base_lr = initial_lr
-        self.base_clip = self.eps_clip
-        self.base_entropy = self.entropy_coeff  # 现在是0.0
-        self.base_K = self.K_epochs
-        self.base_vf = self.vf_coeff
-
-        # 退火目标（来自你的要求）
-        self.tail_lr_target = float(config.get('tail_lr_target', 8e-5))   # 2e-4 -> 8e-5（若你的初始lr=2e-4则会下降）
-        self.tail_clip_target = float(config.get('tail_clip_target', 0.06))
-        self.tail_entropy_target = float(config.get('tail_entropy_target', 0.0))  # 保持为0
-        self.tail_K_target = int(config.get('tail_K_epochs_target', 6))
-        self.tail_vf_target = float(config.get('tail_vf_coeff_target', 0.5))
-
-        # 退火阶段是否禁用自适应调度（避免二者"打架"，在尾段以退火为准）
-        self.disable_scheduler_in_tail = bool(config.get('disable_scheduler_in_tail', True))
-
-    # 8.23修改_序号2：尾段线性退火内核
-    # 说明：当 episode >= tail_start_episode 时，按线性插值更新 lr/clip/entropy/K_epochs/vf_coeff。
-    def _apply_tail_anneal(self):
-        self._episode_counter += 1
-        if self._episode_counter < self.tail_start_episode:
-            return False  # 还未进入尾段
-
-        # 进度（0~1）
-        denom = max(1, self.total_episodes - self.tail_start_episode)
-        p = min(1.0, (self._episode_counter - self.tail_start_episode) / denom)
-
-        # 线性插值函数
-        def lerp(a, b, t): return a + (b - a) * t
-
-        # 计算当下目标
-        lr_target = lerp(self.base_lr, self.tail_lr_target, p)
-        clip_target = lerp(self.base_clip, self.tail_clip_target, p)
-        entropy_target = lerp(self.base_entropy, self.tail_entropy_target, p)  # 0.0 -> 0.0
-        K_target = int(round(lerp(self.base_K, self.tail_K_target, p)))
-        vf_target = lerp(self.base_vf, self.tail_vf_target, p)
-
-        # 设置优化器学习率（尾段直接以退火值为准）
-        for g in self.optimizer.param_groups:
-            g['lr'] = lr_target
-
-        # 覆盖本轮训练所用的关键超参
-        self.eps_clip = float(clip_target)
-        self.entropy_coeff = float(entropy_target)  # 保持为0
-        self.K_epochs = int(max(1, K_target))
-        self.vf_coeff = float(vf_target)
-
-        print(f"[TailAnneal] ep={self._episode_counter} p={p:.2f} | "
-              f"lr={lr_target:.2e} clip={self.eps_clip:.3f} "
-              f"entropy={self.entropy_coeff:.4f} K={self.K_epochs} vf={self.vf_coeff:.2f}")
-        return True
-
-    def update(self, memory: Memory):
-        dev = self.agent.device
         
-        # 8.23修改_序号3：在每次update开始时尝试应用"尾段线性退火"
-        # 说明：进入尾段后，学习率直接以退火值为准；并可选择禁用自适应调度器。
-        in_tail = self._apply_tail_anneal()
+        # =======================================================================
+        # *** 探索机制训练调度配置 - EXPLORATION TRAINING SCHEDULE CONFIG ***
+        # =======================================================================
+        self.exploration_schedule = {
+            'update_frequency': config.get('epsilon_update_frequency', 10),        # 每10次更新调整一次epsilon
+            'performance_threshold': config.get('exploration_performance_threshold', -50),  # 性能阈值
+            'adaptive_exploration': config.get('adaptive_exploration', True),       # 自适应探索开关
+            'exploration_boost_episodes': config.get('exploration_boost_episodes', 100),  # 前100回合加强探索
+        }
+        
+        self.update_count = 0
+        
+        print("🎯 PPO TRAINING WITH EXPLORATION MECHANISM INITIALIZED")
+        print(f"   Update frequency: every {self.exploration_schedule['update_frequency']} updates")
+        print(f"   Performance threshold: {self.exploration_schedule['performance_threshold']}")
+        print(f"   Adaptive exploration: {self.exploration_schedule['adaptive_exploration']}")
 
+    def update(self, memory: Memory, eval_reward: float = None):
+        dev = self.agent.device
+        self.update_count += 1
+        
+        # =======================================================================
+        # *** 探索机制更新调度 - EXPLORATION MECHANISM UPDATE SCHEDULE ***
+        # =======================================================================
+        if self.update_count % self.exploration_schedule['update_frequency'] == 0:
+            old_epsilon = self.agent.current_epsilon
+            
+            # 基于性能的自适应探索率调整
+            if self.exploration_schedule['adaptive_exploration'] and eval_reward is not None:
+                if eval_reward < self.exploration_schedule['performance_threshold']:
+                    # 性能不佳，适度增加探索
+                    self.agent.current_epsilon = min(
+                        self.agent.current_epsilon * 1.1,
+                        self.agent.exploration_config['initial_epsilon'] * 0.8
+                    )
+                    print(f"📈 [ADAPTIVE EXPLORATION] Performance low ({eval_reward:.1f}), "
+                          f"boosted ε: {old_epsilon:.3f} → {self.agent.current_epsilon:.3f}")
+                else:
+                    # 性能良好，正常衰减探索率
+                    self.agent.update_epsilon()
+                    
+                    if abs(old_epsilon - self.agent.current_epsilon) > 0.001:
+                        print(f"📉 [NORMAL DECAY] Performance good ({eval_reward:.1f}), "
+                              f"ε: {old_epsilon:.3f} → {self.agent.current_epsilon:.3f}")
+            else:
+                # 标准探索率更新
+                self.agent.update_epsilon()
+        
         # 学习率监控
         current_lr = self.optimizer.param_groups[0]['lr']
-        print(f"\nCurrent Learning Rate: {current_lr:.2e}")
+        print(f"\n🔧 Update #{self.update_count} - LR: {current_lr:.2e}, Epsilon: {self.agent.current_epsilon:.3f}")
         
         rewards = torch.tensor(memory.rewards, dtype=torch.float32, device=dev)
         values = torch.tensor(memory.values, dtype=torch.float32, device=dev)
@@ -618,10 +793,12 @@ class EnhancedPPO:
                 
                 entropy_loss = entropy.mean()
                 
-                # *** 注意：entropy_coeff现在为0，所以熵损失不会影响训练 ***
+                # *** 新增：探索阶段自适应损失权重 ***
+                exploration_factor = 1.0 + 0.5 * self.agent.current_epsilon  # 探索期增加熵权重
+                
                 total_loss = (actor_loss + 
                              self.vf_coeff * critic_loss - 
-                             self.entropy_coeff * entropy_loss)  # entropy_coeff = 0
+                             self.entropy_coeff * exploration_factor * entropy_loss)
                 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -648,30 +825,27 @@ class EnhancedPPO:
         
         self.agent.update_old_policy()
         
-        # 8.23修改_序号4：与自适应调度器的配合策略
-        # 说明：若进入尾段并启用"禁止调度器"，则不再调用scheduler.step，完全以退火值为准。
-        #       尾段前维持你原有自适应调度逻辑。
+        # *** 核心改进：自适应学习率调度 ***
         avg_critic_loss = total_critic_loss / num_updates
         avg_reward = rewards.mean().item()
-        if not (in_tail and self.disable_scheduler_in_tail):
-            self.scheduler.step(avg_critic_loss, avg_reward)
+        self.scheduler.step(avg_critic_loss, avg_reward)
         
-        # 更新训练统计
+        # *** 新增：更新训练统计（包括探索信息） ***
         self.training_stats['critic_losses'].append(avg_critic_loss)
         self.training_stats['actor_losses'].append(total_actor_loss / num_updates)
+        self.training_stats['exploration_stats'].append(self.agent.get_exploration_stats())
         
         return {
             'actor_loss': total_actor_loss / num_updates,
             'critic_loss': avg_critic_loss,
             'entropy_loss': total_entropy_loss / num_updates,
             'current_lr': self.optimizer.param_groups[0]['lr'],
-            # 8.23修改_序号5：把当前关键超参也回传（logger若未收集会自动忽略）
-            'current_eps_clip': self.eps_clip,
-            'current_entropy_coeff': self.entropy_coeff,
-            'current_vf_coeff': self.vf_coeff,
-            'current_K_epochs': self.K_epochs,
             'grad_norm_actor': np.mean(self.agent.grad_stats['actor'][-10:]) if self.agent.grad_stats['actor'] else 0,
-            'grad_norm_critic': np.mean(self.agent.grad_stats['critic'][-10:]) if self.agent.grad_stats['critic'] else 0
+            'grad_norm_critic': np.mean(self.agent.grad_stats['critic'][-10:]) if self.agent.grad_stats['critic'] else 0,
+            # *** 探索机制相关统计信息 ***
+            'exploration_epsilon': self.agent.current_epsilon,
+            'exploration_phase': self.training_stats['exploration_stats'][-1]['exploration_phase'],
+            'total_random_actions': self.training_stats['exploration_stats'][-1]['total_random_actions'],
         }
 
     def check_early_stop(self, eval_reward: float) -> bool:

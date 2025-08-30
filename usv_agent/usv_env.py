@@ -111,8 +111,8 @@ class USVEnv:
         # *** 关键修复：立即更新当前makespan ***
         self._update_current_makespan()
         
-        # 新的一周修改+序号1：将reward简化为makespan的负数
-        reward = self._compute_simple_negative_makespan_reward(prev_makespan)
+        # *** 修复：使用更合理的奖励函数 ***
+        reward = self._compute_improved_reward(usv_idx, task_idx, prev_makespan)
         
         self.step_count += 1
         self.done = all(t.status != 'unscheduled' for t in self.tasks)
@@ -171,43 +171,80 @@ class USVEnv:
         self.makespan = max_completion
         print(f"[INFO] Makespan recalculated: {self.makespan}")
 
-    # 新的一周修改+序号1：简化奖励函数为makespan的负数
-    def _compute_simple_negative_makespan_reward(self, prev_makespan: float) -> float:
-        """
-        简化的奖励函数：直接使用makespan的负数作为奖励
-        makespan越小，奖励越大（因为是负数）
-        """
-        # 基本奖励：当前makespan的负数
-        base_reward = -self.makespan
+    def _compute_improved_reward(self, usv_idx: int, task_idx: int, prev_makespan: float) -> float:
+        """*** 平衡修复版本的奖励函数 ***"""
+        u = self.usvs[usv_idx]
+        t = self.tasks[task_idx]
         
-        # 添加小的进度奖励，鼓励完成任务
-        progress_reward = 1.0  # 每完成一个任务给予固定奖励
+        # 1. *** 平衡修复：适中的基础进度奖励 ***
+        progress_reward = self.reward_config.get('w_progress', 1.8)  # 提升到1.8，接近原来但不过高
         
-        # 最终奖励
-        total_reward = base_reward + progress_reward
+        # 2. *** 平衡修复：温和的makespan改善奖励 ***
+        makespan_improvement = prev_makespan - self.makespan
+        makespan_reward = makespan_improvement * self.reward_config.get('w_makespan_improvement', 1.0)  # 降低到1.0
         
-        if self.debug_mode:
-            print(f"[DEBUG] Simple reward: base={base_reward:.2f}, progress={progress_reward:.2f}, total={total_reward:.2f}")
+        # 3. 距离惩罚：鼓励选择近距离任务
+        travel_distance = np.linalg.norm(u.position - t.position)
+        max_distance = np.linalg.norm(self.map_size)
+        distance_penalty = -(travel_distance / max_distance) * self.reward_config.get('w_distance', 0.4)
+        
+        # 4. 负载均衡奖励：鼓励任务分配均匀
+        task_counts = [len(usv.assigned_tasks) for usv in self.usvs]
+        current_count = task_counts[usv_idx]
+        min_count = min(task_counts)
+        max_count = max(task_counts)
+        
+        balance_reward = 0.0
+        if current_count == min_count:
+            balance_reward = self.reward_config.get('w_balance', 0.6)
+        elif current_count == max_count and max_count > min_count:
+            balance_reward = -self.reward_config.get('w_balance', 0.6)
+        
+        # 5. 效率奖励：鼓励短处理时间的任务优先
+        efficiency_reward = -(t.processing_time / 30.0) * self.reward_config.get('w_efficiency', 0.4)
+        
+        # 6. *** 平衡修复：大幅减轻makespan惩罚 ***
+        makespan_penalty = -(self.makespan / 200.0) * self.reward_config.get('w_makespan_penalty', 0.2)  # 从1.0降到0.2
+        
+        total_reward = (progress_reward + makespan_reward + distance_penalty + 
+                       balance_reward + efficiency_reward + makespan_penalty)
         
         return total_reward
 
     def _compute_final_reward(self) -> float:
-        """*** 简化版本的最终奖励 ***"""
+        """*** 平衡修复版本的最终奖励 ***"""
         # *** 重要：最终检查并确保makespan正确 ***
         self._update_current_makespan()
         
-        # 简单的最终奖励：makespan的负数乘以一个系数
-        final_reward = -self.makespan * 2.0  # 最终给予更大的权重
+        # 1. *** 关键：温和的Makespan奖励 ***
+        makespan_reward = -self.makespan / self.reward_config.get('makespan_normalization', 200.0) * 8.0  # 降低权重
         
-        # 合法性检查奖励
+        # 2. 负载均衡奖励
+        task_counts = [len(u.assigned_tasks) for u in self.usvs]
+        sum_sq = sum(x**2 for x in task_counts)
+        jain_index = (sum(task_counts)**2) / (self.num_usvs * sum_sq) if sum_sq > 0 else 1.0
+        balance_reward = jain_index * self.reward_config.get('w_final_balance', 4.0)
+        
+        # 3. 效率奖励（步数越少越好）
+        efficiency_reward = -(self.step_count / self.num_tasks) * self.reward_config.get('w_step_efficiency', 0.3)
+        
+        # 4. 方差惩罚
+        variance_penalty = -np.var(task_counts) * self.reward_config.get('w_variance', 0.2)
+        
+        # *** 平衡修复：大幅减轻validity检查惩罚 ***
+        validity_bonus = 0.0
         min_possible_makespan = max(t.processing_time for t in self.tasks) if self.tasks else 0
         if self.makespan >= min_possible_makespan:
-            final_reward += 10.0  # 合法解的小奖励
+            validity_bonus = 1.0  # 小幅奖励而不是大幅
         else:
-            final_reward -= 50.0  # 不合法解的惩罚
+            validity_bonus = -3.0  # 从-20减轻到-3
+        
+        final_reward = makespan_reward + balance_reward + efficiency_reward + variance_penalty + validity_bonus
         
         if self.debug_mode:
-            print(f"[DEBUG] Final reward: makespan_penalty={-self.makespan * 2.0:.2f}, total={final_reward:.2f}")
+            print(f"[DEBUG] Final rewards - makespan: {makespan_reward:.2f}, balance: {balance_reward:.2f}, "
+                  f"efficiency: {efficiency_reward:.2f}, variance: {variance_penalty:.2f}, validity: {validity_bonus:.2f}")
+            print(f"[DEBUG] Final makespan: {self.makespan:.2f}, Jain index: {jain_index:.3f}")
         
         return final_reward
 
@@ -258,41 +295,3 @@ class USVEnv:
     def set_debug_mode(self, enabled: bool):
         """*** 新增：控制调试模式 ***"""
         self.debug_mode = enabled
-
-    # 新的一周修改+序号2：添加环境验证方法
-    def validate_environment_state(self):
-        """验证环境状态的正确性"""
-        print("\n=== Environment State Validation ===")
-        
-        # 检查任务分配
-        assigned_tasks = set()
-        for usv in self.usvs:
-            for task_id in usv.assigned_tasks:
-                if task_id in assigned_tasks:
-                    print(f"[ERROR] Task {task_id} assigned to multiple USVs!")
-                    return False
-                assigned_tasks.add(task_id)
-        
-        # 检查时间一致性
-        for usv in self.usvs:
-            for task_id in usv.assigned_tasks:
-                if task_id < len(self.tasks):
-                    task = self.tasks[task_id]
-                    if task.assigned_usv != usv.id:
-                        print(f"[ERROR] Task {task_id} assignment inconsistency!")
-                        return False
-                    if task.completion_time is None or task.start_time is None:
-                        print(f"[ERROR] Task {task_id} missing time information!")
-                        return False
-        
-        # 检查makespan计算
-        calculated_makespan = max(u.available_time for u in self.usvs) if self.usvs else 0.0
-        if abs(calculated_makespan - self.makespan) > 1e-6:
-            print(f"[ERROR] Makespan inconsistency: calculated={calculated_makespan}, stored={self.makespan}")
-            return False
-        
-        print("[INFO] Environment state validation passed!")
-        print(f"[INFO] Current makespan: {self.makespan:.2f}")
-        print(f"[INFO] Assigned tasks: {len(assigned_tasks)}/{self.num_tasks}")
-        print("=====================================\n")
-        return True

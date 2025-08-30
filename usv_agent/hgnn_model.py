@@ -23,102 +23,6 @@ class PositionalEncoding(nn.Module):
         # 修复：确保维度匹配
         return x + pos_enc[:, :, :x.size(-1)]
 
-# 新的一周修改+序号4：添加特征归一化层
-class FeatureNormalizer(nn.Module):
-    """
-    特征归一化层：对USV和Task节点特征进行归一化处理
-    包括位置坐标、时间特征、处理时间等的归一化
-    """
-    def __init__(self, usv_dim: int, task_dim: int, map_size: float = 100.0):
-        super().__init__()
-        self.usv_dim = usv_dim
-        self.task_dim = task_dim
-        self.map_size = map_size
-        
-        # USV特征归一化参数 [position_x, position_y, available_time]
-        self.usv_normalizers = nn.ModuleDict({
-            'position': nn.Identity(),  # 位置将通过map_size归一化
-            'time': nn.BatchNorm1d(1),  # available_time用BatchNorm
-        })
-        
-        # Task特征归一化参数 [position_x, position_y, processing_time, status]
-        self.task_normalizers = nn.ModuleDict({
-            'position': nn.Identity(),  # 位置将通过map_size归一化
-            'processing_time': nn.BatchNorm1d(1),  # 处理时间用BatchNorm
-            'status': nn.Identity(),  # 状态特征0/1不需要归一化
-        })
-        
-        print(f"[INFO] Feature normalizer initialized - USV dim: {usv_dim}, Task dim: {task_dim}, Map size: {map_size}")
-
-    def normalize_usv_features(self, usv_features):
-        """
-        归一化USV特征
-        usv_features: [B, U, 3] - [position_x, position_y, available_time]
-        """
-        B, U, _ = usv_features.shape
-        
-        # 分离特征
-        positions = usv_features[:, :, :2]  # [B, U, 2]
-        available_times = usv_features[:, :, 2:3]  # [B, U, 1]
-        
-        # 位置归一化 - 除以地图大小
-        normalized_positions = positions / self.map_size
-        
-        # 时间归一化 - 使用BatchNorm
-        # 重塑为 [B*U, 1] 进行BatchNorm，然后恢复形状
-        available_times_flat = available_times.view(-1, 1)
-        normalized_times_flat = self.usv_normalizers['time'](available_times_flat)
-        normalized_times = normalized_times_flat.view(B, U, 1)
-        
-        # 组合归一化后的特征
-        normalized_usv_features = torch.cat([
-            normalized_positions,
-            normalized_times
-        ], dim=-1)
-        
-        return normalized_usv_features
-
-    def normalize_task_features(self, task_features):
-        """
-        归一化Task特征
-        task_features: [B, T, 4] - [position_x, position_y, processing_time, status]
-        """
-        B, T, _ = task_features.shape
-        
-        # 分离特征
-        positions = task_features[:, :, :2]  # [B, T, 2]
-        processing_times = task_features[:, :, 2:3]  # [B, T, 1]
-        status = task_features[:, :, 3:4]  # [B, T, 1]
-        
-        # 位置归一化 - 除以地图大小
-        normalized_positions = positions / self.map_size
-        
-        # 处理时间归一化 - 使用BatchNorm
-        # 重塑为 [B*T, 1] 进行BatchNorm，然后恢复形状
-        processing_times_flat = processing_times.view(-1, 1)
-        normalized_processing_times_flat = self.task_normalizers['processing_time'](processing_times_flat)
-        normalized_processing_times = normalized_processing_times_flat.view(B, T, 1)
-        
-        # 状态特征不需要归一化
-        normalized_status = status
-        
-        # 组合归一化后的特征
-        normalized_task_features = torch.cat([
-            normalized_positions,
-            normalized_processing_times,
-            normalized_status
-        ], dim=-1)
-        
-        return normalized_task_features
-
-    def forward(self, usv_features, task_features):
-        """
-        前向传播：同时归一化USV和Task特征
-        """
-        normalized_usv = self.normalize_usv_features(usv_features)
-        normalized_task = self.normalize_task_features(task_features)
-        return normalized_usv, normalized_task
-
 class MultiHeadGraphAttention(nn.Module):
     """*** 核心改进：多头图注意力机制 ***"""
     def __init__(self, input_dim: int, output_dim: int, num_heads: int = 4, dropout: float = 0.1):
@@ -357,14 +261,6 @@ class EnhancedHeterogeneousGNN(nn.Module):
         self.edge_dim_ut = 3
         self.edge_dim_tt = 1
         
-        # 新的一周修改+序号4：添加特征归一化层
-        # 说明：在HGNN模型开始前，对输入的USV和Task特征进行归一化处理
-        self.feature_normalizer = FeatureNormalizer(
-            usv_dim=self.usv_dim,
-            task_dim=self.task_dim,
-            map_size=config.get('map_size', 100.0)
-        )
-        
         # *** 核心改进：使用增强的嵌入层 ***
         self.usv_layers = nn.ModuleList()
         self.task_layers = nn.ModuleList()
@@ -393,12 +289,6 @@ class EnhancedHeterogeneousGNN(nn.Module):
         )
 
     def forward(self, usv_features, task_features, usv_task_edges) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 新的一周修改+序号4：特征归一化处理
-        # 说明：在进入图神经网络前，先对所有特征进行归一化，提高训练稳定性和收敛速度
-        usv_features, task_features = self.feature_normalizer(usv_features, task_features)
-        print(f"[DEBUG] Features normalized - USV range: [{usv_features.min():.3f}, {usv_features.max():.3f}], "
-              f"Task range: [{task_features.min():.3f}, {task_features.max():.3f}]")
-        
         usv_features = usv_features.to(dtype=self.dtype)
         task_features = task_features.to(dtype=self.dtype)
         usv_task_edges = usv_task_edges.to(dtype=self.dtype)
