@@ -96,9 +96,9 @@
     "report_root": "results/reports",
     "report_episodes": 50,
     "viz": true,
-    "viz_name": "USV_EXPLORATION_V16",
-    "save_root": "results/saved_models",
+    "viz_name": "USV_EXPLORATION_V21",
+    "save_root": "results/saved_models_2",
     "save_only_last": false,
-    "run_name": "Exploration_Enhanced_v16"
+    "run_name": "Exploration_Enhanced_v21"
   }
 }
