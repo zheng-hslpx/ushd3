@@ -56,13 +56,14 @@ def short_ts() -> str:
 
 
 # -------------------- 边特征：对角线归一距离 + 两个轻量前瞻量 --------------------
+# ★ 修复点：避免对 expand 视图做原位除法；统一改为“非原位除法”产生新张量
 
 def compute_lookahead_edges(state: Dict[str, np.ndarray], map_size, device: torch.device) -> torch.Tensor:
     """
     输入 state：{'usv_features':[U,3], 'task_features':[T,4]}
     返回 usv_task_edges：[U,T,3] = [dist_ut_norm, task_proximity, usv_opportunity]
       - dist_ut_norm：USV-Task 欧氏距离 / 地图对角线
-      - task_proximity：任务之间的最小邻距（未调度任务），广播到 U
+      - task_proximity：任务之间的最小邻距（仅未调度任务），广播到 U
       - usv_opportunity：每艘 USV 到最近未调度任务的距离，广播到 T
     """
     uf = torch.as_tensor(state["usv_features"], dtype=torch.float32, device=device)   # [U,3]
@@ -75,7 +76,8 @@ def compute_lookahead_edges(state: Dict[str, np.ndarray], map_size, device: torc
 
     # U×T 距离
     dist_ut = torch.cdist(usv_pos, task_pos) if (U > 0 and T > 0) else torch.zeros(U, T, device=device)
-    # 未调度任务间的最小邻距
+
+    # 未调度任务间的最小邻距（广播到 U）
     prox = torch.zeros(T, device=device)
     if active.sum() > 1:
         pos_u = task_pos[active]
@@ -83,20 +85,23 @@ def compute_lookahead_edges(state: Dict[str, np.ndarray], map_size, device: torc
         d_tt.fill_diagonal_(float("inf"))
         min_d, _ = torch.min(d_tt, dim=1)
         prox[active] = min_d
+    # 注意：expand 产生视图，后续不要原位写入
     feat_task_proximity = prox.unsqueeze(0).expand(U, -1) if T > 0 else torch.zeros(U, T, device=device)
-    # 每艘 USV 到最近未调度任务的距离
-    feat_usv_opp = torch.zeros(U, T, device=device)
-    if active.any():
-        d_uu = torch.cdist(usv_pos, task_pos[active])
-        min_du, _ = torch.min(d_uu, dim=1)              # [U]
-        feat_usv_opp = min_du.unsqueeze(1).expand(-1, T)
 
-    # 对角线归一
+    # 每艘 USV 到最近未调度任务的距离（广播到 T）
+    if active.any():
+        d_uu = torch.cdist(usv_pos, task_pos[active])  # [U, #active]
+        min_du, _ = torch.min(d_uu, dim=1)             # [U]
+        feat_usv_opp = min_du.unsqueeze(1).expand(-1, T) if T > 0 else torch.zeros(U, T, device=device)
+    else:
+        feat_usv_opp = torch.zeros(U, T, device=device)
+
+    # 对角线归一（避免原位操作！）
     diag = torch.norm(torch.as_tensor(map_size, dtype=torch.float32, device=device))
     if diag > 0:
-        dist_ut /= diag
-        feat_task_proximity /= diag
-        feat_usv_opp /= diag
+        dist_ut = dist_ut / diag
+        feat_task_proximity = feat_task_proximity / diag
+        feat_usv_opp = feat_usv_opp / diag
 
     return torch.stack([dist_ut, feat_task_proximity, feat_usv_opp], dim=-1)  # [U,T,3]
 
@@ -351,4 +356,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
