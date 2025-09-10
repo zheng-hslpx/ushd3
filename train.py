@@ -1,623 +1,354 @@
-import os
-import matplotlib
-matplotlib.use('Agg')  # 设置非交互式后端 - 必须在其他matplotlib导入之前
-import matplotlib.pyplot as plt
-plt.ioff()  # 关闭交互模式
 
-import json, argparse, csv, re
+import os, re, json, argparse, csv
 from pathlib import Path
 from datetime import datetime
-from typing import Dict  
+from typing import Dict, Any
+
 import numpy as np
 import torch
 from tqdm import tqdm
 
+# 后端与作图（非交互）
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+plt.ioff()
+
+# ===== 依赖模块 =====
 from usv_agent.usv_env import USVEnv
 from usv_agent.hgnn_model import HeterogeneousGNN
-
-# =============================================================================
-# *** 探索机制修改1: 导入增强版PPO类 - Import Enhanced PPO Classes ***
-# =============================================================================
-# 原代码：from usv_agent.ppo_policy import PPOAgent, PPO, Memory
 from usv_agent.ppo_policy import EnhancedPPOAgent, EnhancedPPO, Memory
-# 保持兼容性别名
-PPOAgent, PPO = EnhancedPPOAgent, EnhancedPPO
 
-from utils.vis_manager import VisualizationManager
+# 可选 Visdom（没有也不影响）
+try:
+    from utils.vis_manager import VisualizationManager
+except Exception:
+    VisualizationManager = None
 
-# 设置全局默认数据类型
 torch.set_default_dtype(torch.float32)
 
-def load_config(path):
+
+# -------------------- 工具方法 --------------------
+
+def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _device_from_cfg(model_cfg):
-    want = str(model_cfg.get('device', 'auto')).lower()
-    if want == 'auto':
+def pick_device(model_cfg: Dict[str, Any]) -> torch.device:
+    want = str(model_cfg.get("device", "auto")).lower()
+    if want == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if want.startswith('cuda') and not torch.cuda.is_available():
-        print("[WARN] CUDA is not available, falling back to CPU")
-        return torch.device('cpu')
+    if want.startswith("cuda") and not torch.cuda.is_available():
+        print("[WARN] CUDA 不可用，改用 CPU")
+        return torch.device("cpu")
     return torch.device(want)
 
-def _group_name(cfg):
-    return cfg['train_paras'].get('run_name', 'default_run')
+def group_name(cfg: Dict[str, Any]) -> str:
+    return cfg.get("train_paras", {}).get("run_name", "default_run")
 
-def _next_run_index(dir_path: Path) -> str:
-    dir_path.mkdir(parents=True, exist_ok=True)
-    nums = [int(p.name) for p in dir_path.iterdir() if p.is_dir() and re.fullmatch(r'\d{2,}', p.name)]
+def next_run_index(group_dir: Path) -> str:
+    group_dir.mkdir(parents=True, exist_ok=True)
+    nums = [int(p.name) for p in group_dir.iterdir() if p.is_dir() and re.fullmatch(r"\d{2,}", p.name)]
     return f"{(max(nums) + 1) if nums else 1:02d}"
 
-def _short_ts():
+def short_ts() -> str:
     return datetime.now().strftime("%m%d_%H%M%S")
 
-def compute_lookahead_features(state: Dict, device: torch.device) -> torch.Tensor:
-    usv_pos = torch.from_numpy(state['usv_features'][:, :2]).float().to(device)
-    task_pos = torch.from_numpy(state['task_features'][:, :2]).float().to(device)
-    task_status = torch.from_numpy(state['task_features'][:, 3]).float().to(device)
-    map_size = torch.tensor(state['map_size'], dtype=torch.float32, device=device)
-    
-    U, T = usv_pos.shape[0], task_pos.shape[0]
-    dist_ut = torch.cdist(usv_pos, task_pos)
-    
-    unassigned_mask = task_status > 0
-    unassigned_pos = task_pos[unassigned_mask]
-    
-    feat_task_proximity = torch.zeros(U, T, device=device)
-    if unassigned_pos.shape[0] > 1:
-        dist_tt_unassigned = torch.cdist(unassigned_pos, unassigned_pos)
-        dist_tt_unassigned.fill_diagonal_(float('inf'))
-        min_dist_tt, _ = torch.min(dist_tt_unassigned, dim=1)
-        temp_prox = torch.zeros(T, device=device)
-        temp_prox[unassigned_mask] = min_dist_tt
-        feat_task_proximity = temp_prox.unsqueeze(0).expand(U, -1).clone()
 
-    feat_usv_opportunity = torch.zeros(U, T, device=device)
-    if unassigned_pos.shape[0] > 0:
-        dist_usv_to_unassigned = torch.cdist(usv_pos, unassigned_pos)
-        min_dist_usv, _ = torch.min(dist_usv_to_unassigned, dim=1)
-        feat_usv_opportunity = min_dist_usv.unsqueeze(1).expand(-1, T).clone()
+# -------------------- 边特征：对角线归一距离 + 两个轻量前瞻量 --------------------
 
-    map_diag = torch.norm(map_size)
-    if map_diag > 0:
-        dist_ut /= map_diag
-        feat_task_proximity /= map_diag
-        feat_usv_opportunity /= map_diag
-    
-    usv_task_edges = torch.stack([dist_ut, feat_task_proximity, feat_usv_opportunity], dim=-1)
-    return usv_task_edges
+def compute_lookahead_edges(state: Dict[str, np.ndarray], map_size, device: torch.device) -> torch.Tensor:
+    """
+    输入 state：{'usv_features':[U,3], 'task_features':[T,4]}
+    返回 usv_task_edges：[U,T,3] = [dist_ut_norm, task_proximity, usv_opportunity]
+      - dist_ut_norm：USV-Task 欧氏距离 / 地图对角线
+      - task_proximity：任务之间的最小邻距（未调度任务），广播到 U
+      - usv_opportunity：每艘 USV 到最近未调度任务的距离，广播到 T
+    """
+    uf = torch.as_tensor(state["usv_features"], dtype=torch.float32, device=device)   # [U,3]
+    tf = torch.as_tensor(state["task_features"], dtype=torch.float32, device=device)  # [T,4]
+    U, T = uf.size(0), tf.size(0)
 
-def evaluate(env: USVEnv, agent: EnhancedPPOAgent, episodes: int = 5, deterministic: bool = True):
-    """*** 修复：增强的评估函数，增加 makespan异常检测 ***"""
-    ms_list, rews_list, balance_list = [], [], []
-    invalid_episodes = 0  # *** 新增：记录异常episode数量 ***
-    
-    # ==========================================================================
-    # *** 探索机制修改2: 评估时禁用探索模式 - Disable Exploration in Evaluation ***
-    # ==========================================================================
-    agent.set_train_mode(False)  # 禁用探索，使用确定性策略
-    
-    # *** 新增：临时禁用调试模式以减少输出 ***
-    original_debug = env.debug_mode
+    usv_pos = uf[:, :2]                   # [U,2]
+    task_pos = tf[:, :2]                  # [T,2]
+    active   = tf[:, 3] > 0               # [T]
+
+    # U×T 距离
+    dist_ut = torch.cdist(usv_pos, task_pos) if (U > 0 and T > 0) else torch.zeros(U, T, device=device)
+    # 未调度任务间的最小邻距
+    prox = torch.zeros(T, device=device)
+    if active.sum() > 1:
+        pos_u = task_pos[active]
+        d_tt = torch.cdist(pos_u, pos_u)
+        d_tt.fill_diagonal_(float("inf"))
+        min_d, _ = torch.min(d_tt, dim=1)
+        prox[active] = min_d
+    feat_task_proximity = prox.unsqueeze(0).expand(U, -1) if T > 0 else torch.zeros(U, T, device=device)
+    # 每艘 USV 到最近未调度任务的距离
+    feat_usv_opp = torch.zeros(U, T, device=device)
+    if active.any():
+        d_uu = torch.cdist(usv_pos, task_pos[active])
+        min_du, _ = torch.min(d_uu, dim=1)              # [U]
+        feat_usv_opp = min_du.unsqueeze(1).expand(-1, T)
+
+    # 对角线归一
+    diag = torch.norm(torch.as_tensor(map_size, dtype=torch.float32, device=device))
+    if diag > 0:
+        dist_ut /= diag
+        feat_task_proximity /= diag
+        feat_usv_opp /= diag
+
+    return torch.stack([dist_ut, feat_task_proximity, feat_usv_opp], dim=-1)  # [U,T,3]
+
+
+# -------------------- 评估（奖励=ΔMakespan） --------------------
+
+@torch.no_grad()
+def evaluate(env: USVEnv, agent: EnhancedPPOAgent, episodes: int = 5) -> Dict[str, float]:
+    """
+    评估（禁用探索，确定性策略）：
+    返回：平均 makespan / ΔMakespan(reward) / Jain 指数 / makespan std
+    """
+    agent.set_train_mode(False)
+    orig_debug = env.debug_mode
     env.set_debug_mode(False)
-    
-    for ep in range(episodes):
-        state = env.reset()
-        state['map_size'] = env.map_size
-        done, total_r = False, 0.0
-        step_count = 0
-        
-        while not done:
-            with torch.no_grad():
-                usv_task_edges = compute_lookahead_features(state, agent.device)
-            
-            # =================================================================
-            # *** 探索机制修改3: 评估时使用确定性动作选择 ***
-            # =================================================================
-            # 原代码：a, _, _ = agent.get_action(state, usv_task_edges, deterministic=deterministic)
-            a, _, _ = agent.get_action(state, usv_task_edges, deterministic=True)  # 强制确定性
-            
-            state, r, done, info = env.step(a)
-            state['map_size'] = env.map_size
-            total_r += float(r)
-            step_count += 1
-            
-            # *** 新增：防止无限循环 ***
-            if step_count > env.num_tasks * 2:
-                print(f"[WARN] Episode {ep} exceeded maximum steps, forcing termination")
-                break
-        
-        makespan = info.get('makespan', 0.0)
-        
-        # *** 新增：makespan异常检测 ***
-        min_task_time = min(t.processing_time for t in env.tasks) if env.tasks else 0
-        if makespan <= 0 or makespan < min_task_time:
-            print(f"[WARN] Invalid makespan in eval episode {ep}: {makespan}")
-            invalid_episodes += 1
-            # 使用一个合理的默认值，而不是跳过
-            makespan = max(min_task_time, 1.0)
-        
-        ms_list.append(makespan)
-        rews_list.append(total_r)
-        balance_metrics = env.get_balance_metrics()
-        balance_list.append(balance_metrics['jains_index'])
-    
-    # *** 恢复调试模式 ***
-    env.set_debug_mode(original_debug)
-    
-    # ==========================================================================
-    # *** 探索机制修改4: 评估后重新启用探索模式 ***
-    # ==========================================================================
-    agent.set_train_mode(True)  # 重新启用探索模式
-    
-    # *** 新增：报告异常情况 ***
-    if invalid_episodes > 0:
-        print(f"[WARN] {invalid_episodes}/{episodes} evaluation episodes had invalid makespan")
-    
+
+    ms_list, rew_list, j_list = [], [], []
+    for _ in range(episodes):
+        s = env.reset()
+        done, ep_rew = False, 0.0
+        max_steps = env.num_usvs * env.num_tasks + 5  # 简单上界
+        steps = 0
+        while not done and steps < max_steps:
+            edges = compute_lookahead_edges(s, env.map_size, device=agent.device)
+            a, logp, v = agent.get_action(s, edges, deterministic=True)  # 确定性
+            s, r, done, info = env.step(a)
+            ep_rew += float(r)
+            steps += 1
+        ms_list.append(float(info.get("makespan", 0.0)))
+        j_list.append(float(env.get_balance_metrics()["jains_index"]))
+        rew_list.append(float(ep_rew))
+
+    env.set_debug_mode(orig_debug)
+    agent.set_train_mode(True)
+
     return {
-        'makespan': float(np.mean(ms_list)),
-        'reward': float(np.mean(rews_list)),
-        'jains_index': float(np.mean(balance_list)),
-        'makespan_std': float(np.std(ms_list)),
-        'invalid_episodes': invalid_episodes  # *** 新增：返回异常episode数量 ***
+        "makespan": float(np.mean(ms_list)),
+        "makespan_std": float(np.std(ms_list)),
+        "reward": float(np.mean(rew_list)),        # ΔMakespan（越大越好）
+        "jains_index": float(np.mean(j_list)),
     }
 
+
+# -------------------- 简易日志器（CSV + 小图） --------------------
+
 class MetricsLogger:
-    def __init__(self, run_dir: Path, prefix: str, plot_every: int = 40):
-        self.run_dir = run_dir; self.prefix = prefix
-        self.csv_path  = run_dir / f"{prefix}metrics.csv"
+    def __init__(self, run_dir: Path, prefix: str, plot_every: int = 50):
+        self.run_dir = run_dir
+        self.csv_path = run_dir / f"{prefix}metrics.csv"
         self.plot_path = run_dir / f"{prefix}metrics.png"
         self.plot_every = int(plot_every)
-        
-        # =======================================================================
-        # *** 探索机制修改5: 添加探索相关统计列 - Add Exploration Statistics ***
-        # =======================================================================
-        self.headers = ["episode","train_makespan","train_reward","actor_loss","critic_loss","entropy_loss",
-                        "eval_makespan","eval_reward","jains_index","task_load_variance","current_lr",
-                        "exploration_epsilon","total_random_actions","exploration_phase"]  # 新增探索统计列
-        
+        self.headers = [
+            "episode", "train_makespan", "train_delta_ms", "actor_loss", "critic_loss", "entropy",
+            "eval_makespan", "eval_delta_ms", "jains_index", "lr_critic", "epsilon"
+        ]
         if not self.csv_path.exists():
             with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(self.headers)
         self.data = {h: [] for h in self.headers}
 
-    def log(self, ep, metrics: dict):
-        for h in self.headers: self.data[h].append(metrics.get(h, np.nan))
+    def log(self, ep: int, row: Dict[str, float]):
+        for h in self.headers:
+            self.data[h].append(row.get(h, np.nan))
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([metrics.get(h) for h in self.headers])
-        if ep % self.plot_every == 0 or ep == 1: self.plot()
+            csv.writer(f).writerow([row.get(h, "") for h in self.headers])
+        if ep % self.plot_every == 0 or ep == 1:
+            self.plot()
 
     def plot(self):
-        if not self.data["episode"]: return
-        fig, axes = plt.subplots(3, 4, figsize=(20, 15))  # 增加一行用于探索统计
+        if not self.data["episode"]:
+            return
+        fig, axes = plt.subplots(2, 3, figsize=(16, 8))
         axes = axes.flatten()
-        
-        plot_map = {
-            'Makespan': ('train_makespan', 'eval_makespan'), 
-            'Reward': ('train_reward', 'eval_reward'),
-            "Jain's Fairness Index": ('jains_index',), 
-            'Actor Loss': ('actor_loss',),
-            'Critic Loss': ('critic_loss',), 
-            'Entropy Loss': ('entropy_loss',),
-            'Task Load Variance': ('task_load_variance',),
-            'Learning Rate': ('current_lr',),
-            # *** 新增：探索机制相关图表 ***
-            'Exploration Epsilon': ('exploration_epsilon',),
-            'Random Actions (Cumulative)': ('total_random_actions',),
-            'Exploration Phase': ('exploration_phase',),
-            'Reserved': ()  # 占位符
-        }
-        
-        for i, (title, keys) in enumerate(plot_map.items()):
-            if i >= len(axes): break
-            ax = axes[i]; ax.set_title(title); ax.set_xlabel("Episode")
-            
-            if not keys:  # 占位符图表
-                ax.text(0.5, 0.5, 'Reserved for\nFuture Metrics', 
-                       ha='center', va='center', transform=ax.transAxes)
-                continue
-                
-            if title == 'Exploration Phase':
-                # 特殊处理探索阶段图表
-                phase_data = self.data[keys[0]]
-                episodes = self.data['episode']
-                early_eps = [ep for ep, phase in zip(episodes, phase_data) if phase == 'early']
-                late_eps = [ep for ep, phase in zip(episodes, phase_data) if phase == 'late']
-                ax.scatter(early_eps, [1]*len(early_eps), label='Early Exploration', alpha=0.6)
-                ax.scatter(late_eps, [0]*len(late_eps), label='Late Exploration', alpha=0.6)
-                ax.set_ylim(-0.1, 1.1)
-                ax.set_yticks([0, 1])
-                ax.set_yticklabels(['Late', 'Early'])
-                ax.legend()
-            else:
-                ax.plot(self.data['episode'], self.data[keys[0]], label="train")
-                if len(keys) > 1 and not all(np.isnan(self.data[keys[1]])):
-                    ax.plot(self.data['episode'], self.data[keys[1]], linestyle="--", label="eval")
-                if 'makespan' in keys[0] or 'reward' in keys[0]: ax.legend()
-                if 'Fairness' in title: ax.set_ylim(0, 1.05)
-                if 'Learning Rate' in title: ax.set_yscale('log')
-                if 'Epsilon' in title: ax.set_ylim(0, 0.35)  # 探索率范围
-            
-            ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)  # 确保关闭图形以释放内存
+        # ΔMakespan
+        axes[0].plot(self.data["episode"], self.data["train_delta_ms"], label="train")
+        if any(np.isfinite(self.data["eval_delta_ms"])):
+            axes[0].plot(self.data["episode"], self.data["eval_delta_ms"], "--", label="eval")
+        axes[0].set_title("ΔMakespan (Reward)"); axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
-def validate_model_architecture(hgnn, agent, env, device):
-    """*** 新增：模型架构验证函数 ***"""
-    print("\n=== Model Architecture Validation ===")
-    
-    # 获取样本数据
-    sample_state = env.reset()
-    sample_state['map_size'] = env.map_size
-    
-    # 转换为torch tensors
-    usv_features = torch.from_numpy(sample_state['usv_features']).float().unsqueeze(0).to(device)
-    task_features = torch.from_numpy(sample_state['task_features']).float().unsqueeze(0).to(device)
-    usv_task_edges = compute_lookahead_features(sample_state, device).unsqueeze(0)
-    
-    print(f"Input shapes:")
-    print(f"  USV features: {usv_features.shape}")
-    print(f"  Task features: {task_features.shape}")
-    print(f"  USV-Task edges: {usv_task_edges.shape}")
-    
-    # 测试HGNN前向传播
-    try:
-        with torch.no_grad():
-            usv_emb, task_emb, graph_emb = hgnn(usv_features, task_features, usv_task_edges)
-        print(f"✅ HGNN forward pass successful!")
-        print(f"  USV embeddings: {usv_emb.shape}")
-        print(f"  Task embeddings: {task_emb.shape}")
-        print(f"  Graph embeddings: {graph_emb.shape}")
-    except Exception as e:
-        print(f"❌ HGNN forward pass failed: {e}")
-        raise e
-    
-    # 测试Agent前向传播
-    try:
-        with torch.no_grad():
-            action, logp, value = agent.get_action(sample_state, usv_task_edges.squeeze(0), deterministic=False)
-        print(f"✅ Agent forward pass successful!")
-        print(f"  Action: {action}")
-        print(f"  Log probability: {logp}")
-        print(f"  Value: {value}")
-    except Exception as e:
-        print(f"❌ Agent forward pass failed: {e}")
-        raise e
-    
-    # 计算模型参数数量
-    total_params = sum(p.numel() for p in hgnn.parameters())
-    trainable_params = sum(p.numel() for p in hgnn.parameters() if p.requires_grad)
-    agent_params = sum(p.numel() for p in agent.parameters())
-    
-    print(f"📊 Model Statistics:")
-    print(f"  HGNN total parameters: {total_params:,}")
-    print(f"  HGNN trainable parameters: {trainable_params:,}")
-    print(f"  Agent total parameters: {agent_params:,}")
-    print(f"  Memory usage: {torch.cuda.memory_allocated(device) / 1024**2:.1f} MB" if device.type == 'cuda' else "  Memory usage: CPU mode")
-    
-    print("=" * 50 + "\n")
-    return True
+        axes[1].plot(self.data["episode"], self.data["train_makespan"], label="train")
+        axes[1].plot(self.data["episode"], self.data["eval_makespan"], "--", label="eval")
+        axes[1].set_title("Makespan"); axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(self.data["episode"], self.data["jains_index"])
+        axes[2].set_title("Jain's Index"); axes[2].set_ylim(0, 1.05); axes[2].grid(True, alpha=0.3)
+
+        axes[3].plot(self.data["episode"], self.data["actor_loss"])
+        axes[3].set_title("Actor Loss"); axes[3].grid(True, alpha=0.3)
+
+        axes[4].plot(self.data["episode"], self.data["critic_loss"])
+        axes[4].set_title("Critic Loss"); axes[4].grid(True, alpha=0.3)
+
+        axes[5].plot(self.data["episode"], self.data["epsilon"])
+        axes[5].set_title("Epsilon"); axes[5].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(self.plot_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+
+# -------------------- 主流程 --------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "improved_config.json"), 
-                       help="Path to config file")
+    parser.add_argument("--config", type=str, default=os.path.join("config", "improved_config.json"),
+                        help="配置文件路径")
+    parser.add_argument("--save_root", type=str, default="results/saved_models2",
+                        help="保存根目录（将创建 run 子目录）")
     args = parser.parse_args()
-    
+
     cfg = load_config(args.config)
-    env_cfg, model_cfg, train_cfg = cfg['env_paras'], cfg['model_paras'], cfg['train_paras']
-    device = _device_from_cfg(model_cfg)
-    
-    print(f"[INFO] Using device: {device}, Torch version: {torch.__version__}")
-    print(f"[INFO] Model config: HGNN layers={model_cfg['num_hgnn_layers']}, dropout={model_cfg['dropout']}")
-    print(f"[INFO] Train config: lr={train_cfg['lr']}, entropy_coeff={train_cfg['entropy_coeff']}")
+    env_cfg = cfg["env_paras"]; model_cfg = cfg["model_paras"]; train_cfg = cfg["train_paras"]
 
-    save_root = Path(train_cfg.get('save_root', "results/saved_models"))
-    group_dir = save_root / _group_name(cfg)
-    run_dir = group_dir / _next_run_index(group_dir)
+    device = pick_device(model_cfg)
+    print(f"[INFO] Device: {device} | Torch: {torch.__version__}")
+
+    # 结果目录：results/saved_models2/<run_name>/<01,02,...>
+    save_root = Path(train_cfg.get("save_root", args.save_root))
+    run_group = save_root / group_name(cfg)
+    run_dir = run_group / next_run_index(run_group)
     run_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{_short_ts()}_"
-    print(f"[INFO] Artifacts will be saved in: {run_dir}")
+    prefix = f"{short_ts()}_"
+    print(f"[INFO] 保存目录: {run_dir}")
+    with open(run_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-    with open(run_dir / "config.json", "w") as f:
-        json.dump(cfg, f, indent=2)
-
+    # 构建环境/模型/智能体/优化器
     env = USVEnv(env_cfg)
-    
-    # *** 新增：控制调试模式 ***
-    debug_training = train_cfg.get('debug_mode', False)
-    env.set_debug_mode(debug_training)
-    if debug_training:
-        print("[INFO] Debug mode enabled - detailed logs will be shown")
-    
-    ##############################################
-    # 环境状态结构检查
-    ##############################################
-    print("\n=== Environment State Structure Check ===")
-    sample_state = env.reset()
-    print("State keys:", sample_state.keys())
-    print("usv_features type/shape:", 
-          type(sample_state['usv_features']), 
-          sample_state['usv_features'].shape)
-    print("task_features type/shape:", 
-          type(sample_state['task_features']), 
-          sample_state['task_features'].shape)
-    print("action_mask type/shape:", 
-          type(sample_state['action_mask']), 
-          sample_state['action_mask'].shape)
-    
-    # 额外检查数据范围
-    print("\nData Range Check:")
-    print("usv_features min/max:", 
-          np.min(sample_state['usv_features']), 
-          np.max(sample_state['usv_features']))
-    print("task_features min/max:", 
-          np.min(sample_state['task_features']), 
-          np.max(sample_state['task_features']))
-    print("action_mask sum:", np.sum(sample_state['action_mask']))
-    
-    # *** 新增：makespan初始化检查 ***
-    print(f"Initial makespan: {env.makespan}")
-    print("=======================================\n")
-    ##############################################
-    # 环境检查代码结束
-    ##############################################
-    
-    # ==========================================================================
-    # *** 探索机制修改6: 模型初始化 - 使用增强版PPO类 ***
-    # ==========================================================================
-    try:
-        hgnn = HeterogeneousGNN(model_cfg).to(device)
-        # 原代码：agent = PPOAgent(hgnn, model_cfg).to(device)
-        agent = EnhancedPPOAgent(hgnn, model_cfg).to(device)  # 使用增强版PPO智能体
-        print("✅ Models created successfully")
-    except Exception as e:
-        print(f"❌ Model creation failed: {e}")
-        raise e
-    
-    # *** 新增：模型架构验证 ***
-    validate_model_architecture(hgnn, agent, env, device)
-    
-    # ==========================================================================
-    # *** 探索机制修改7: PPO训练器初始化 ***
-    # ==========================================================================
-    # 原代码：ppo = PPO(agent, train_cfg)
-    ppo = EnhancedPPO(agent, train_cfg)  # 使用增强版PPO训练器
+    hgnn = HeterogeneousGNN({**model_cfg, "num_usvs": env_cfg["num_usvs"], "num_tasks": env_cfg["num_tasks"]}).to(device)
+    agent = EnhancedPPOAgent(hgnn, {**model_cfg, **train_cfg}).to(device)
+    ppo = EnhancedPPO(agent, train_cfg)
     memory = Memory()
-    
-    # ==========================================================================
-    # *** 探索机制修改8: 启用训练模式和探索机制 - Enable Training Mode ***
-    # ==========================================================================
-    print("\n" + "="*60)
-    print("🎯 STARTING TRAINING WITH EXPLORATION MECHANISM")
-    print("="*60)
-    agent.set_train_mode(True)  # *** 启用探索模式 ***
-    print("🔥 Training mode enabled - Random exploration activated")
-    
+
+    # 可选 Visdom
     viz = None
-    if train_cfg.get('viz', False):
+    if train_cfg.get("viz", False) and VisualizationManager is not None:
         try:
-            viz = VisualizationManager(viz_name=train_cfg['viz_name'], enabled=True)
+            viz = VisualizationManager(viz_name=train_cfg.get("viz_name", "usv"), enabled=True)
         except Exception as e:
-            print(f"Warning: Failed to initialize Visdom. Live plotting disabled. Error: {e}")
-    
-    logger = MetricsLogger(run_dir, prefix, plot_every=train_cfg.get('plot_metrics_every', 50))
-    best_eval_ms = float("inf")
-    best_eval_reward = float("-inf")
+            print(f"[WARN] Visdom 初始化失败：{e}")
 
-    training_stats = {
-        'episodes_completed': 0,
-        'best_makespan': float('inf'),
-        'best_reward': float('-inf'),
-        'early_stop_triggered': False,
-        'invalid_makespan_episodes': 0,  # *** 新增：记录异常episode ***
-        'total_exploration_actions': 0   # *** 新增：探索动作总计 ***
-    }
+    logger = MetricsLogger(run_dir, prefix, plot_every=int(train_cfg.get("plot_metrics_every", 50)))
 
-    print(f"\n🚀 Starting training for {train_cfg['max_episodes']} episodes...")
-    print("=" * 60)
+    # 训练参量
+    max_episodes  = int(train_cfg.get("max_episodes", 1200))
+    eval_every    = int(train_cfg.get("eval_frequency", 25))
+    save_every    = int(train_cfg.get("save_frequency", 100))
+    best_ms       = float("inf")
+    best_reward   = -float("inf")
 
-    for ep in tqdm(range(1, train_cfg['max_episodes'] + 1), desc="Training Progress"):
-        
-        # =======================================================================
-        # *** 探索机制修改9: 每回合重置探索统计 ***
-        # =======================================================================
+    print("\n============================================")
+    print(f"=== Training start: {max_episodes} episodes ===")
+
+    agent.set_train_mode(True)
+    for ep in tqdm(range(1, max_episodes + 1), desc="Training"):
+        s = env.reset()
+        done, ep_rew = False, 0.0
+        steps = 0
+        max_steps = env.num_usvs * env.num_tasks + 5
+
+        # 每回合探索统计复位（仅用于信息输出，不影响算法）
         agent.reset_exploration_episode_stats()
-        
-        state = env.reset()
-        state['map_size'] = env_cfg['map_size']
-        done, ep_reward, last_value = False, 0.0, 0.0
-        
-        # *** 新增：episode级别的异常检测 ***
-        step_count = 0
-        max_steps = env.num_tasks * 3  # 设置最大步数限制
 
-        while not done and step_count < max_steps:
-            with torch.no_grad():
-                usv_task_edges = compute_lookahead_features(state, agent.device)
+        last_value = 0.0
+        while not done and steps < max_steps:
+            edges = compute_lookahead_edges(s, env.map_size, device=agent.device)
+            a, logp, v = agent.get_action(s, edges, deterministic=False)  # 训练时允许 ε-greedy
+            ns, r, done, info = env.step(a)
+            ep_rew += float(r)
+            # 记录一步
+            memory.add(s, a, logp, float(r), bool(done), float(v), edges.cpu())
+            s = ns
+            steps += 1
+            last_value = v
 
-            # =================================================================
-            # *** 探索机制修改10: 启用探索的动作选择 - Exploration-Enabled Action Selection ***
-            # =================================================================
-            # 原代码：action, logp, value = agent.get_action(state, usv_task_edges, deterministic=False)
-            action, logp, value = agent.get_action(
-                state, 
-                usv_task_edges, 
-                deterministic=False  # *** 启用探索的非确定性动作选择 ***
-            )
-            
-            next_state, r, done, info = env.step(action)
-            ep_reward += r
-            step_count += 1
-            
-            # 修改后的调用：
-            memory.add(
-                state,
-                action,
-                logp,
-                float(r),  # 确保是Python float
-                bool(done),  # 确保是Python bool
-                float(value),  # 确保是Python float
-                usv_task_edges.cpu()  # 保持为PyTorch tensor
-            )
-            state = next_state
-            state['map_size'] = env_cfg['map_size']
-            last_value = value
-
-        # *** 新增：检查episode是否正常完成 ***
-        makespan = info.get('makespan', 0.0)
-        if makespan <= 0 or step_count >= max_steps:
-            training_stats['invalid_makespan_episodes'] += 1
-            if step_count >= max_steps:
-                print(f"[WARN] Episode {ep} exceeded maximum steps ({max_steps})")
-            if makespan <= 0:
-                print(f"[WARN] Episode {ep} ended with invalid makespan: {makespan}")
-
-        memory.values.append(last_value)
-        
-        # =======================================================================
-        # *** 探索机制修改11: PPO更新时传入评估奖励 - Pass Evaluation Reward ***
-        # =======================================================================
-        # 原代码：losses = ppo.update(memory)
-        losses = ppo.update(memory, eval_reward=ep_reward)  # *** 传入评估奖励用于探索率调整 ***
+        # 终止后追加 bootstrap 值（终局取 0 即可）
+        memory.values.append(0.0)
+        # PPO 更新
+        losses = ppo.update(memory, eval_reward=ep_rew)
         memory.clear_memory()
 
-        # *** 新增：收集探索统计信息 ***
-        exploration_stats = agent.get_exploration_stats()
-        training_stats['total_exploration_actions'] = exploration_stats['total_random_actions']
-
-        log_metrics = {
-            'episode': ep, 
-            'train_makespan': makespan, 
-            'train_reward': ep_reward,
-            # *** 探索机制统计信息 ***
-            'exploration_epsilon': exploration_stats['current_epsilon'],
-            'total_random_actions': exploration_stats['total_random_actions'],
-            'exploration_phase': exploration_stats['exploration_phase']
+        # 日志与可视化
+        log_row = {
+            "episode": ep,
+            "train_makespan": float(info.get("makespan", 0.0)),
+            "train_delta_ms": float(ep_rew),                 # ΔMakespan（reward 的累计）
+            "actor_loss": float(losses.get("actor_loss", 0.0)),
+            "critic_loss": float(losses.get("critic_loss", 0.0)),
+            "entropy": float(losses.get("entropy", 0.0)),
+            "lr_critic": float(losses.get("lr_critic", 0.0)),
+            "epsilon": float(losses.get("epsilon", 0.0)),
+            "eval_makespan": np.nan, "eval_delta_ms": np.nan, "jains_index": float(env.get_balance_metrics()["jains_index"])
         }
-        log_metrics.update(losses)
-        log_metrics.update(env.get_balance_metrics())
 
-        training_stats['episodes_completed'] = ep
-        if makespan > 0 and makespan < training_stats['best_makespan']:  # *** 修复：只有合理的makespan才更新最佳记录 ***
-            training_stats['best_makespan'] = makespan
-        if ep_reward > training_stats['best_reward']:
-            training_stats['best_reward'] = ep_reward
+        if viz and getattr(viz, "enabled", False):
+            try:
+                viz.update_plots(ep, {
+                    "train_reward": log_row["train_delta_ms"],   # 复用键名
+                    "train_makespan": log_row["train_makespan"],
+                    "actor_loss": log_row["actor_loss"],
+                    "critic_loss": log_row["critic_loss"],
+                    "entropy": log_row["entropy"],
+                    "jains_index": log_row["jains_index"],
+                    "eval_reward": np.nan, "eval_makespan": np.nan
+                })
+            except Exception:
+                pass
 
-        if viz and viz.enabled:
-            viz.update_plots(ep, log_metrics)
-
-        # =======================================================================
-        # *** 探索机制修改12: 评估阶段的模式切换 - Mode Switching in Evaluation ***
-        # =======================================================================
-        if ep % train_cfg['eval_frequency'] == 0:
-            print(f"\n--- Episode {ep} 评估阶段 (Exploration ε={exploration_stats['current_epsilon']:.3f}) ---")
-            
-            # *** 评估时会自动切换模式（在evaluate函数内部） ***
-            eval_results = evaluate(env, agent, episodes=5)
-            log_metrics.update({
-                'eval_makespan': eval_results['makespan'],
-                'eval_reward': eval_results['reward']
+        # 周期性评估（确定性策略）
+        if ep % eval_every == 0:
+            eval_res = evaluate(env, agent, episodes=int(train_cfg.get("eval_episodes", 5)))
+            log_row.update({
+                "eval_makespan": eval_res["makespan"],
+                "eval_delta_ms": eval_res["reward"],
+                "jains_index": eval_res["jains_index"]
             })
-            
-            # *** 修复：增强评估报告 ***
-            print(f"[Eval Ep {ep:4d}] Makespan: {eval_results['makespan']:.2f}±{eval_results['makespan_std']:.2f}, "
-                  f"Reward: {eval_results['reward']:.2f}, Jain's: {eval_results['jains_index']:.3f}")
-            
-            # *** 新增：探索机制状态报告 ***
-            print(f"[Exploration Status] ε={exploration_stats['current_epsilon']:.3f}, "
-                  f"Random Actions: {exploration_stats['total_random_actions']}, "
-                  f"Phase: {exploration_stats['exploration_phase']}")
-            
-            if eval_results.get('invalid_episodes', 0) > 0:
-                print(f"  ⚠️ {eval_results['invalid_episodes']}/5 eval episodes had issues")
+            print(f"[Eval {ep:4d}] Makespan: {eval_res['makespan']:.2f} ± {eval_res['makespan_std']:.2f} | "
+                  f"ΔMakespan (Reward): {eval_res['reward']:.2f} | Jain's: {eval_res['jains_index']:.3f}")
 
-            # *** 修复：只有合理的结果才更新最佳模型 ***
-            if eval_results['makespan'] > 0 and eval_results['makespan'] < best_eval_ms:
-                best_eval_ms = eval_results['makespan']
-                torch.save(agent.state_dict(), run_dir / f"{prefix}best_makespan_model.pt")
-                print(f"  🎯 New best makespan model saved: {best_eval_ms:.2f}")
-            
-            if eval_results['reward'] > best_eval_reward:
-                best_eval_reward = eval_results['reward']
-                torch.save(agent.state_dict(), run_dir / f"{prefix}best_reward_model.pt")
-                print(f"  🎯 New best reward model saved: {best_eval_reward:.2f}")
-            
-            if ppo.check_early_stop(eval_results['reward']):
-                print(f"\nℹ️ Early stopping triggered at episode {ep}")
-                training_stats['early_stop_triggered'] = True
+            # 保存最优
+            if eval_res["makespan"] < best_ms:
+                best_ms = eval_res["makespan"]
+                torch.save(agent.state_dict(), run_dir / f"{prefix}best_makespan.pt")
+                print(f"  ↳ Save best makespan: {best_ms:.2f}")
+            if eval_res["reward"] > best_reward:
+                best_reward = eval_res["reward"]
+                torch.save(agent.state_dict(), run_dir / f"{prefix}best_reward.pt")
+                print(f"  ↳ Save best ΔMakespan reward: {best_reward:.2f}")
+
+            # 早停（可选）
+            if ppo.check_early_stop(eval_res["reward"]):
+                print(f"[INFO] Early stop at episode {ep}")
+                logger.log(ep, log_row)
                 break
-        
-        # =======================================================================
-        # *** 探索机制修改13: 定期探索机制总结 - Periodic Exploration Summary ***
-        # =======================================================================
-        if ep % 100 == 0:
-            print(f"\n--- Episode {ep} 探索机制总结 ---")
-            agent.log_exploration_summary()
-        
-        logger.log(ep, log_metrics)
 
-        if ep % train_cfg['save_frequency'] == 0:
+        # 周期性快照
+        if ep % save_every == 0:
             torch.save(agent.state_dict(), run_dir / f"{prefix}ep{ep:04d}.pt")
             torch.save(agent.state_dict(), run_dir / f"{prefix}latest.pt")
-    
-    print("\n" + "=" * 60)
-    print("🎉 Training finished!")
-    print(f"📊 Episodes completed: {training_stats['episodes_completed']}")
-    print(f"📈 Best makespan achieved: {training_stats['best_makespan']:.2f}")
-    print(f"🏆 Best reward achieved: {training_stats['best_reward']:.2f}")
-    print(f"🎲 Total exploration actions: {training_stats['total_exploration_actions']}")
-    print(f"⚠️ Episodes with issues: {training_stats['invalid_makespan_episodes']}")
-    if training_stats['early_stop_triggered']:
-        print("ℹ️ Training stopped early due to convergence")
-    
-    final_model_path = run_dir / f"{prefix}final_model.pt"
-    torch.save(agent.state_dict(), final_model_path)
-    
-    with open(run_dir / f"{prefix}training_stats.json", "w") as f:
-        # *** 修复：确保所有数据都是JSON可序列化的 ***
-        serializable_stats = {k: float(v) if isinstance(v, np.number) else v 
-                             for k, v in training_stats.items()}
-        json.dump(serializable_stats, f, indent=2)
-    
-    # ==========================================================================
-    # *** 探索机制修改14: 最终评估时的模式管理 - Final Evaluation Mode Management ***
-    # ==========================================================================
-    try:
-        viz_final = VisualizationManager(viz_name="final_gantt", enabled=False)
-        
-        best_model_path = run_dir / f"{prefix}best_makespan_model.pt"
-        if best_model_path.exists():
-            print(f"[INFO] Loading best makespan model for final Gantt chart")
-            agent.load_state_dict(torch.load(best_model_path, map_location=device))
-        
-        # *** 最终评估时启用调试模式并禁用探索 ***
-        env.set_debug_mode(True)
-        agent.set_train_mode(False)  # 确保最终评估时完全禁用探索
-        
-        print("\n🎯 执行最终确定性评估...")
-        evaluate(env, agent, episodes=1, deterministic=True)
-        
-        gantt_path = run_dir / f"{prefix}gantt_final.png"
-        summary = viz_final.generate_gantt_chart(env, save_path=str(gantt_path))
-        
-        table_path = run_dir / f"{prefix}gantt_table.png"
-        viz_final.save_summary_table(summary, env.makespan, str(table_path))
-        print(f"✅ Final Gantt chart and summary table saved.")
-        
-        final_balance = env.get_balance_metrics()
-        print(f"📊 Final Jain's Index: {final_balance['jains_index']:.4f}")
-        print(f"📊 Final Task Load Variance: {final_balance['task_load_variance']:.4f}")
-        print(f"📊 Final Makespan: {env.makespan:.2f}")
-        
-    except Exception as e:
-        print(f"[WARN] Failed to generate final report: {e}")
 
-    print(f"✅ All artifacts saved in: {run_dir}")
-    print("=" * 60)
+        logger.log(ep, log_row)
+
+    # 收尾：保存最终模型与一次最终评估
+    torch.save(agent.state_dict(), run_dir / f"{prefix}final.pt")
+    final_eval = evaluate(env, agent, episodes=int(train_cfg.get("final_eval_episodes", 3)))
+    print("\n=== Training finished ===")
+    print(f"Best makespan: {best_ms:.2f} | Best ΔMakespan reward: {best_reward:.2f}")
+    print(f"Final eval → Makespan: {final_eval['makespan']:.2f} ± {final_eval['makespan_std']:.2f}, "
+          f"ΔMakespan: {final_eval['reward']:.2f}, Jain's: {final_eval['jains_index']:.3f}")
+    print(f"Artifacts saved in: {run_dir}")
+
 
 if __name__ == "__main__":
     main()
+
