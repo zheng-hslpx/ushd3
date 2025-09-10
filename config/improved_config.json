@@ -3,102 +3,73 @@
     "num_usvs": 5,
     "num_tasks": 24,
     "map_size": [120, 120],
+    "device": "cuda:0",
     "battery_capacity": 220.0,
     "usv_speed": 5.0,
     "charge_time": 30.0,
-    "device": "cuda:0",
     "min_task_time_visual": 5.0,
     "reward_config": {
       "use_potential_based_reward": false,
       "makespan_normalization": 200.0,
-      
-      "_comment": "基于第12次成功配置的极保守调整",
-      "w_makespan_improvement": 1.2,
-      "w_makespan_penalty": 0.6,
-      
-      "w_progress": 2.3,
+      "w_makespan_improvement": 1.0,
+      "w_makespan_penalty": 0.4,
+      "w_progress": 2.2,
       "w_efficiency": 0.5,
       "w_step_efficiency": 0.3,
-      
-      "w_balance": 0.2,
-      "w_final_balance": 3.0,
-      "w_variance": 0.18,
-      
-      "w_distance": 0.4,
-      "w_timing": 0.8,
-      "baseline_reward": 51,
+      "w_balance": 0.8,
+      "w_final_balance": 7.0,
       "coverage_bonus": 3.0,
-      "empty_usv_terminal_penalty": 25.0
-    },
-    "dynamic_masking_config": {
-      "enabled": true,
-      "max_load_ratio": 1.4
+      "empty_usv_terminal_penalty": 20.0,
+      "baseline_reward": 51.0
     }
   },
-  
+
   "model_paras": {
-    "embedding_dim": 64,
-    "num_heads": 1,
-    "num_attention_heads": 4,
-    "num_hgnn_layers": 3,
-    "eta_neighbors": 3,
-    "mlp_hidden_dim": 128,
-    "n_hidden_actor": 3,
-    "n_hidden_critic": 5,
+    "embedding_dim": 128,
+    "dropout": 0.10,
+    "arch_slim": true,
+    "slim_threshold": 120,
+    "disable_feature_attention": true,
     "n_latent_actor": 128,
-    "n_latent_critic": 256,
-    "dropout": 0.15,
-    "device": "cuda:0",
-    "use_batch_norm": true,
-    "graph_pool": "mean",
-    "residual_blocks": 2,
-    
-    "_exploration_comment": "=== 探索机制核心参数 ===",
-    "initial_epsilon": 0.3,
+    "n_latent_critic": 128,
+    "n_hidden_actor": 2,
+    "n_hidden_critic": 2
+  },
+
+  "train_paras": {
+    "run_name": "RTX2060_5x25/v25",
+    "save_root": "results/saved_models_2/v25",
+
+    "max_episodes": 500,
+    "max_episode_steps": 550,
+    "eval_frequency": 25,
+    "validate_interval": 25,
+    "plot_metrics_every": 50,
+
+    "gamma": 0.995,
+    "gae_lambda": 0.95,
+    "eps_clip": 0.15,
+    "vf_coeff": 0.30,
+    "entropy_coeff": 0.02,
+    "K_epochs": 4,
+    "minibatch_size": 256,
+    "max_grad_norm": 0.5,
+
+    "lr": 0.00008,
+    "lr_actor": 0.00008,
+    "lr_critic": 0.00016,
+    "critic_updates_per_epoch": 2,
+    "actor_updates_per_epoch": 1,
+
+    "initial_epsilon": 0.30,
     "min_epsilon": 0.05,
     "epsilon_decay": 0.995,
     "exploration_steps": 1000,
-    "adaptive_epsilon": true
-  },
-  
-  "train_paras": {
-    "_comment": "增强训练稳定性 + 探索机制参数",
-    "lr": 0.0002,
-    "betas": [0.9, 0.999],
-    "gamma": 0.99,
-    "gae_lambda": 0.95,
-    "K_epochs": 4,
-    "eps_clip": 0.15,
-    "A_coeff": 1.0,
-    "vf_coeff": 0.4,
-    "entropy_coeff": 0.015,
-    "max_grad_norm": 0.5,
-    
-    "warmup_steps": 120,
-    "lr_decay_patience": 60,
-    "min_lr": 5e-07,
-    "early_stop_patience": 200,
-    "max_episodes": 1000,
-    "minibatch_size": 64,
-    "save_frequency": 80,
-    "eval_frequency": 25,
-    
-    "_exploration_schedule_comment": "=== 探索机制训练调度参数 ===",
-    "epsilon_update_frequency": 10,
-    "exploration_performance_threshold": -50,
-    "adaptive_exploration": true,
-    "exploration_boost_episodes": 100,
-    
-    "_debug_comment": "=== 调试和可视化参数 ===",
-    "debug_mode": false,
-    "plot_metrics_every": 50,
-    
-    "report_root": "results/reports",
-    "report_episodes": 50,
+
+    "buffer_size": 12288,
+    "batch_size": 512,
+
     "viz": true,
-    "viz_name": "USV_EXPLORATION_V21",
-    "save_root": "results/saved_models_2",
-    "save_only_last": false,
-    "run_name": "Exploration_Enhanced_v21"
+    "viz_name": "RTX2060_5x24"
   }
 }
