@@ -1,4 +1,3 @@
-
 import os, re, json, argparse, csv
 from pathlib import Path
 from datetime import datetime
@@ -351,6 +350,33 @@ def main():
     print(f"Best makespan: {best_ms:.2f} | Best ΔMakespan reward: {best_reward:.2f}")
     print(f"Final eval → Makespan: {final_eval['makespan']:.2f} ± {final_eval['makespan_std']:.2f}, "
           f"ΔMakespan: {final_eval['reward']:.2f}, Jain's: {final_eval['jains_index']:.3f}")
+
+    # === Final Gantt === 生成并保存甘特图与汇总表（只新增这段；其他逻辑不变） ===
+    try:
+        if VisualizationManager is None:
+            raise RuntimeError("VisualizationManager 未可用")
+
+        agent.set_train_mode(False)  # 确保确定性
+        s = env.reset()
+        done = False
+        steps = 0
+        max_steps = env.num_usvs * env.num_tasks + 5
+        while not done and steps < max_steps:
+            edges = compute_lookahead_edges(s, env.map_size, device=agent.device)
+            a, _, _ = agent.get_action(s, edges, deterministic=True)
+            s, _, done, _ = env.step(a)
+            steps += 1
+
+        viz_final = VisualizationManager(viz_name="final_gantt", enabled=False)
+        gantt_path = run_dir / f"{prefix}gantt_final.png"
+        summary = viz_final.generate_gantt_chart(env, save_path=str(gantt_path))
+        table_path = run_dir / f"{prefix}gantt_table.png"
+        viz_final.save_summary_table(summary, env.makespan, save_path=str(table_path))
+        print(f"✅ Gantt saved to: {gantt_path}")
+        print(f"✅ Summary saved to: {table_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to generate final Gantt: {e}")
+
     print(f"Artifacts saved in: {run_dir}")
 
 
