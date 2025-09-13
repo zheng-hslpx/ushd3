@@ -23,7 +23,6 @@
       "baseline_reward": 51.0
     }
   },
-
   "model_paras": {
     "embedding_dim": 128,
     "dropout": 0.10,
@@ -32,44 +31,46 @@
     "disable_feature_attention": true,
     "n_latent_actor": 128,
     "n_latent_critic": 128,
-    "n_hidden_actor": 2,
-    "n_hidden_critic": 2
+    "n_hidden_actor": 3,
+    "n_hidden_critic": 3
   },
-
   "train_paras": {
-    "run_name": "RTX2060_5x25/v25",
-    "save_root": "results/saved_models_2/v25",
-
-    "max_episodes": 500,
+    "run_name": "RTX2060_5x24",
+    "save_root": "results/saved_models_3",
+    "max_episodes": 300,
     "max_episode_steps": 550,
-    "eval_frequency": 25,
+    "eval_frequency": 10,
     "validate_interval": 25,
     "plot_metrics_every": 50,
-
     "gamma": 0.995,
-    "gae_lambda": 0.95,
-    "eps_clip": 0.15,
-    "vf_coeff": 0.30,
+    "gae_lambda": 0.92,
+    "eps_clip": 0.3,
+    "vf_coeff": 0.5,
     "entropy_coeff": 0.02,
-    "K_epochs": 4,
-    "minibatch_size": 256,
-    "max_grad_norm": 0.5,
-
-    "lr": 0.00008,
-    "lr_actor": 0.00008,
-    "lr_critic": 0.00016,
-    "critic_updates_per_epoch": 2,
-    "actor_updates_per_epoch": 1,
-
+    "entropy_schedule": [[0, 0.02], [150, 0.01], [250, 0.005], [300, 0.001]],
+    "K_epochs": 6,
+    "minibatch_size": 512,
+    "max_grad_norm": 2.0,
+    "lr": 8e-6,
+    "lr_actor": 8e-6,
+    "lr_critic": 1.6e-5,
+    "critic_updates_per_epoch": 4,
+    "actor_updates_per_epoch": 2,
     "initial_epsilon": 0.30,
     "min_epsilon": 0.05,
-    "epsilon_decay": 0.995,
+    "epsilon_decay": 1,
     "exploration_steps": 1000,
-
     "buffer_size": 12288,
     "batch_size": 512,
-
     "viz": true,
-    "viz_name": "RTX2060_5x24"
+    "viz_name": "RTX2060_5x24/v30",
+    "plot_eval_only": true
+  },
+  "eval_fixed_cases": {
+    "enabled": true,
+    "seeds": [20250911],
+    "min_processing_time": 8.0,
+    "max_processing_time": 30.0,
+    "task_distribution": "uniform"
   }
 }
